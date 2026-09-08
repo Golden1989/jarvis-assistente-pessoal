@@ -4,6 +4,7 @@ Chatbot de terminal com historico de conversa, usando a API da Anthropic.
 """
 
 import anthropic
+from pathlib import Path
 
 MODELO = "claude-sonnet-5"
 MAX_TOKENS_RESPOSTA = 1024
@@ -12,15 +13,29 @@ MAX_TOKENS_RESPOSTA = 1024
 PRECO_ENTRADA = 2.0
 PRECO_SAIDA = 10.0
 
-# "Personalidade" do assistente. Vale para a conversa inteira.
-SYSTEM_PROMPT = (
+# Arquivo opcional com informacoes sobre voce. Fica fora do Git (.gitignore).
+ARQUIVO_PERFIL = "perfil.txt"
+
+# Identidade base — vale mesmo sem o perfil.txt (ex.: repo recém-clonado).
+# Tom, tratamento e detalhes pessoais ficam no perfil.txt.
+SYSTEM_PROMPT_BASE = (
     "Você é o Jarvis, um assistente pessoal para conversar, debater ideias "
-    "e ajudar a pensar com clareza. Seja direto e honesto, aponte falhas no "
-    "raciocínio quando existirem e faça perguntas quando algo estiver ambíguo. "
-    "Responda em português do Brasil."
+    "e ajudar a pensar. Responda em português do Brasil. Se houver uma seção "
+    "de perfil abaixo, siga as preferências dela sobre tom e tratamento."
 )
 
 COMANDOS_SAIR = {"sair", "exit", "quit"}
+
+
+def montar_system_prompt():
+    """Junta a personalidade base com o seu perfil, se o arquivo existir."""
+    prompt = SYSTEM_PROMPT_BASE
+    arquivo = Path(ARQUIVO_PERFIL)
+    if arquivo.exists():
+        perfil = arquivo.read_text(encoding="utf-8").strip()
+        if perfil:
+            prompt += "\n\n# Sobre a pessoa com quem você conversa\n" + perfil
+    return prompt
 
 
 def extrair_texto(resposta):
@@ -37,7 +52,12 @@ def main():
     tokens_entrada = 0   # acumuladores para acompanhar o gasto da sessão
     tokens_saida = 0
 
-    print("Jarvis (Nível 1) — digite 'sair' para encerrar.\n")
+    system_prompt = montar_system_prompt()
+
+    print("Jarvis (Nível 1) — digite 'sair' para encerrar.")
+    if Path(ARQUIVO_PERFIL).exists():
+        print(f"(perfil carregado de {ARQUIVO_PERFIL})")
+    print()
 
     while True:
         try:
@@ -59,7 +79,7 @@ def main():
             resposta = client.messages.create(
                 model=MODELO,
                 max_tokens=MAX_TOKENS_RESPOSTA,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=mensagens,
             )
         except anthropic.APIError as erro:

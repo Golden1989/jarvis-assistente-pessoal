@@ -8,6 +8,9 @@ venv/
 .env
 .env.*
 
+# Perfil pessoal — informações suas, não vão para o repositório público
+perfil.txt
+
 # Config local do editor (tem caminhos da sua máquina)
 .vscode/
 
