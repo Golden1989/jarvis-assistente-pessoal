@@ -1,0 +1,16 @@
+# Cache e ambiente do Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Variáveis de ambiente locais (caso use .env no futuro) — NUNCA versionar
+.env
+.env.*
+
+# Config local do editor (tem caminhos da sua máquina)
+.vscode/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
