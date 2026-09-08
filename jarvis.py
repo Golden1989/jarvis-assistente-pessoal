@@ -1,110 +1,111 @@
 """
-Jarvis - Nivel 1
-Chatbot de terminal com historico de conversa, usando a API da Anthropic.
+Jarvis - Level 1
+Terminal chatbot with conversation history, using the Anthropic API.
 """
 
 import anthropic
 from pathlib import Path
 
-MODELO = "claude-sonnet-5"
-MAX_TOKENS_RESPOSTA = 1024
+MODEL = "claude-sonnet-5"
+MAX_RESPONSE_TOKENS = 1024
 
-# Precos do claude-sonnet-5 (US$ por milhao de tokens).
-PRECO_ENTRADA = 2.0
-PRECO_SAIDA = 10.0
+# claude-sonnet-5 pricing (US$ per million tokens).
+INPUT_PRICE = 2.0
+OUTPUT_PRICE = 10.0
 
-# Arquivo opcional com informacoes sobre voce. Fica fora do Git (.gitignore).
-ARQUIVO_PERFIL = "perfil.txt"
+# Optional file with information about you. Kept out of Git (.gitignore).
+PROFILE_FILE = "profile.txt"
 
-# Identidade base — vale mesmo sem o perfil.txt (ex.: repo recém-clonado).
-# Tom, tratamento e detalhes pessoais ficam no perfil.txt.
-SYSTEM_PROMPT_BASE = (
-    "Você é o Jarvis, um assistente pessoal para conversar, debater ideias "
-    "e ajudar a pensar. Responda em português do Brasil. Se houver uma seção "
-    "de perfil abaixo, siga as preferências dela sobre tom e tratamento."
+# Base identity - applies even without profile.txt (e.g. a fresh clone).
+# Tone, form of address, and personal details live in profile.txt.
+BASE_SYSTEM_PROMPT = (
+    "You are Jarvis, a personal assistant for conversation, debating ideas, "
+    "and thinking things through. Reply in the same language the person writes "
+    "in. If a profile section follows, honor its preferences on tone and "
+    "how to address the person."
 )
 
-COMANDOS_SAIR = {"sair", "exit", "quit"}
+EXIT_COMMANDS = {"quit", "exit"}
 
 
-def montar_system_prompt():
-    """Junta a personalidade base com o seu perfil, se o arquivo existir."""
-    prompt = SYSTEM_PROMPT_BASE
-    arquivo = Path(ARQUIVO_PERFIL)
-    if arquivo.exists():
-        perfil = arquivo.read_text(encoding="utf-8").strip()
-        if perfil:
-            prompt += "\n\n# Sobre a pessoa com quem você conversa\n" + perfil
+def build_system_prompt():
+    """Combine the base identity with your profile, if the file exists."""
+    prompt = BASE_SYSTEM_PROMPT
+    path = Path(PROFILE_FILE)
+    if path.exists():
+        profile = path.read_text(encoding="utf-8").strip()
+        if profile:
+            prompt += "\n\n# About the person you are talking to\n" + profile
     return prompt
 
 
-def extrair_texto(resposta):
-    """A resposta vem como uma lista de blocos; junta os blocos de texto."""
+def extract_text(response):
+    """The response is a list of blocks; join the text ones."""
     return "\n".join(
-        bloco.text for bloco in resposta.content if bloco.type == "text"
+        block.text for block in response.content if block.type == "text"
     )
 
 
 def main():
-    client = anthropic.Anthropic()  # lê ANTHROPIC_API_KEY do ambiente
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
-    mensagens = []       # o histórico da conversa
-    tokens_entrada = 0   # acumuladores para acompanhar o gasto da sessão
-    tokens_saida = 0
+    messages = []       # the conversation history
+    input_tokens = 0    # running totals to track session spend
+    output_tokens = 0
 
-    system_prompt = montar_system_prompt()
+    system_prompt = build_system_prompt()
 
-    print("Jarvis (Nível 1) — digite 'sair' para encerrar.")
-    if Path(ARQUIVO_PERFIL).exists():
-        print(f"(perfil carregado de {ARQUIVO_PERFIL})")
+    print("Jarvis (Level 1) - type 'quit' to exit.")
+    if Path(PROFILE_FILE).exists():
+        print(f"(profile loaded from {PROFILE_FILE})")
     print()
 
     while True:
         try:
-            entrada = input("Você: ").strip()
+            user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
-        if not entrada:
+        if not user_input:
             continue
-        if entrada.lower() in COMANDOS_SAIR:
+        if user_input.lower() in EXIT_COMMANDS:
             break
 
-        # 1. Adiciona a fala do usuário ao histórico.
-        mensagens.append({"role": "user", "content": entrada})
+        # 1. Add the user's turn to the history.
+        messages.append({"role": "user", "content": user_input})
 
-        # 2. Envia o histórico INTEIRO e pede a resposta.
+        # 2. Send the ENTIRE history and ask for a reply.
         try:
-            resposta = client.messages.create(
-                model=MODELO,
-                max_tokens=MAX_TOKENS_RESPOSTA,
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_RESPONSE_TOKENS,
                 system=system_prompt,
-                messages=mensagens,
+                messages=messages,
             )
-        except anthropic.APIError as erro:
-            print(f"\n[erro na chamada: {erro}]\n")
-            mensagens.pop()  # desfaz a última fala p/ o histórico não ficar torto
+        except anthropic.APIError as error:
+            print(f"\n[API call failed: {error}]\n")
+            messages.pop()  # undo the last turn so the history stays consistent
             continue
 
-        # 3. Extrai o texto e 4. guarda no histórico p/ a próxima rodada ter contexto.
-        texto = extrair_texto(resposta)
-        mensagens.append({"role": "assistant", "content": texto})
-        print(f"\nJarvis: {texto}\n")
+        # 3. Extract the text and 4. store it so the next round has context.
+        text = extract_text(response)
+        messages.append({"role": "assistant", "content": text})
+        print(f"\nJarvis: {text}\n")
 
-        # 5. Atualiza e mostra o gasto acumulado da sessão.
-        tokens_entrada += resposta.usage.input_tokens
-        tokens_saida += resposta.usage.output_tokens
-        custo = (
-            tokens_entrada / 1_000_000 * PRECO_ENTRADA
-            + tokens_saida / 1_000_000 * PRECO_SAIDA
+        # 5. Update and show the running session spend.
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
+        cost = (
+            input_tokens / 1_000_000 * INPUT_PRICE
+            + output_tokens / 1_000_000 * OUTPUT_PRICE
         )
         print(
-            f"[sessão: {tokens_entrada} entrada + {tokens_saida} saída tokens"
-            f"  ~US$ {custo:.4f}]\n"
+            f"[session: {input_tokens} input + {output_tokens} output tokens"
+            f"  ~US$ {cost:.4f}]\n"
         )
 
-    print("Até mais.")
+    print("See you.")
 
 
 if __name__ == "__main__":

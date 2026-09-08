@@ -1,19 +1,20 @@
-# Cache e ambiente do Python
+# Python cache and virtual environments
 __pycache__/
 *.pyc
 .venv/
 venv/
 
-# Variáveis de ambiente locais (caso use .env no futuro) — NUNCA versionar
+# Local environment variables (in case you use .env later) - NEVER commit
 .env
 .env.*
 
-# Perfil pessoal — informações suas, não vão para o repositório público
+# Personal profile - your information, never goes to the public repo
+profile.txt
 perfil.txt
 
-# Config local do editor (tem caminhos da sua máquina)
+# Local editor config (contains machine-specific paths)
 .vscode/
 
-# Sistema operacional
+# Operating system
 .DS_Store
 Thumbs.db

@@ -1,19 +1,19 @@
-# Jarvis — assistente pessoal
+# Jarvis — personal assistant
 
-Assistente de IA para conversar, debater ideias e ajudar a pensar. Construído em
-camadas, inspirado (só na ideia) no JARVIS.
+An AI assistant to talk with, debate ideas, and think things through. Built in
+layers, loosely inspired by JARVIS.
 
-**Nível 1 (atual):** chatbot de terminal com histórico de conversa, usando a API
-da Anthropic (modelo Claude Sonnet).
+**Level 1 (current):** terminal chatbot with conversation history, using the
+Anthropic API (Claude Sonnet).
 
-## Requisitos
+## Requirements
 
 - Python 3.12+
-- Uma API key da Anthropic (https://platform.claude.com/settings/keys)
+- An Anthropic API key (https://platform.claude.com/settings/keys)
 
-## Configuração
+## Setup
 
-1. Crie o ambiente e instale as dependências:
+1. Create the environment and install dependencies:
 
    ```
    conda create -n jarvis python=3.12
@@ -21,28 +21,35 @@ da Anthropic (modelo Claude Sonnet).
    pip install -r requirements.txt
    ```
 
-2. Defina a API key como variável de ambiente (nunca coloque a key no código):
+2. Set the API key as an environment variable (never put the key in the code):
 
-   - **Windows:** Painel de Controle → "Editar as variáveis de ambiente da sua
-     conta" → nova variável de usuário `ANTHROPIC_API_KEY` com o valor `sk-ant-...`
+   - **Windows:** Control Panel → "Edit environment variables for your account"
+     → new user variable `ANTHROPIC_API_KEY` with the value `sk-ant-...`
    - **Linux/macOS:** `export ANTHROPIC_API_KEY="sk-ant-..."`
 
-   Feche e reabra o terminal (e o editor) depois de criar a variável.
+   Close and reopen the terminal (and the editor) after creating the variable.
 
-## Uso
+## Usage
 
 ```
 python jarvis.py
 ```
 
-Digite `sair` para encerrar. O custo acumulado da sessão aparece a cada resposta.
+Type `quit` to exit. The running session cost is shown after every reply.
 
-### Scripts auxiliares
+### Optional personal profile
 
-- `teste.py` — uma única chamada à API, para verificar se o ambiente está ok.
-- `modelos.py` — lista os modelos disponíveis para a sua conta.
+Create a `profile.txt` file in the project root with anything you want the
+assistant to know about you (name, pronouns, interests, how you like to be
+addressed). It is loaded into the system prompt at startup. The file is
+git-ignored, so your personal details never reach the repository.
+
+### Helper scripts
+
+- `smoke_test.py` — a single API call, to check that the environment works.
+- `list_models.py` — lists the models available to your account.
 
 ## Roadmap
 
-- **Nível 2:** acesso a ferramentas (web, arquivos, código) via tool use.
-- **Nível 3:** personalidade fixa e memória entre sessões.
+- **Level 2:** tool use — access to the web, files, and code.
+- **Level 3:** fixed persona and memory that persists across sessions.
