@@ -8,9 +8,15 @@ venv/
 .env
 .env.*
 
-# Personal profile - your information, never goes to the public repo
+# Personal context files - your information, never goes to the public repo
 profile.txt
 perfil.txt
+people.txt
+notes.txt
+
+# Google Calendar OAuth secrets - as sensitive as a password, NEVER commit
+credentials.json
+token.json
 
 # Local editor config (contains machine-specific paths)
 .vscode/
