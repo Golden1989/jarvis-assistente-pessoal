@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="scanlines"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">&#9670;</div>
+      <div>
+        <div class="brand-title">JARVIS</div>
+        <div class="brand-tagline">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
+      </div>
+    </div>
+    <div class="status-block">
+      <div class="status-label">SYSTEM STATUS</div>
+      <div class="status-value"><span class="dot" id="status-dot"></span><span id="status-text">OPTIMAL</span></div>
+    </div>
+    <div class="clock-block">
+      <div class="status-label">LOCAL TIME</div>
+      <div class="clock" id="clock">--:--:--</div>
+    </div>
+    <div class="topbar-right">
+      <span class="icon">&#128276;</span>
+      <span class="icon">&#9881;</span>
+      <div class="operator-chip">
+        <span>OPERATOR</span>
+        <div class="operator-dot"></div>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard">
+    <aside class="col col-left">
+      <section class="panel">
+        <div class="panel-head">
+          <span>SYSTEM // SESSION</span>
+          <span class="panel-sub">USAGE</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Tokens In</span>
+          <span class="metric-value" id="tok-in">0</span>
+        </div>
+        <div class="metric">
+          <span class="metric-label">Tokens Out</span>
+          <span class="metric-value" id="tok-out">0</span>
+        </div>
+        <div class="bars" id="bars"></div>
+        <div class="metric">
+          <span class="metric-label">Session Cost</span>
+          <span class="metric-value accent" id="cost">$0.0000</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span>SYSTEM // TOOLS</span>
+          <span class="panel-sub" id="tool-count">0 ONLINE</span>
+        </div>
+        <ul class="tool-list" id="tool-list"></ul>
+      </section>
+    </aside>
+
+    <section class="col col-center">
+      <div class="radar" id="radar">
+        <canvas id="orb-canvas" class="orb-canvas"></canvas>
+        <div class="ring ring-outer"></div>
+        <div class="crosshair crosshair-x"></div>
+        <div class="crosshair crosshair-y"></div>
+        <div class="core-label" id="core-label">CORE ACTIVE</div>
+      </div>
+    </section>
+
+    <aside class="col col-right">
+      <section class="panel">
+        <div class="panel-head">
+          <span>SYSTEM // CALENDAR</span>
+          <span class="panel-sub">NEXT EVENT</span>
+        </div>
+        <div class="calendar-body" id="calendar-body">
+          <span class="dim">No upcoming events.</span>
+        </div>
+      </section>
+
+      <section class="panel panel-log">
+        <div class="panel-head">
+          <span>SYSTEM // ACTIVITY LOG</span>
+          <span class="panel-sub">RT</span>
+        </div>
+        <div class="log" id="log"></div>
+      </section>
+    </aside>
+  </main>
+
+  <form class="command-bar" id="chat-form">
+    <span class="prompt">&gt;</span>
+    <input id="input" type="text" autocomplete="off" placeholder="AWAITING USER INPUT...">
+    <button type="button" id="mic-btn" class="icon-btn" title="Voice input">&#127908;</button>
+    <button type="button" id="lang-btn" class="icon-btn lang-btn" title="Speech recognition language">PT</button>
+    <button type="button" id="mute-btn" class="icon-btn" title="Mute Jarvis' voice">&#128266;</button>
+    <button type="submit">SEND</button>
+  </form>
+
+  <script src="{{ url_for('static', filename='orb.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

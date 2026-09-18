@@ -9,6 +9,7 @@ venv/
 .env.*
 
 # Personal context files - your information, never goes to the public repo
+personality.txt
 profile.txt
 perfil.txt
 people.txt

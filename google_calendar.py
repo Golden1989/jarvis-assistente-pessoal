@@ -6,6 +6,7 @@ authorize Jarvis, then caches a refresh token in token.json so future runs
 don't need to log in again.
 """
 
+import datetime
 import os.path
 
 from google.auth.transport.requests import Request
@@ -88,3 +89,33 @@ def list_events(time_min_iso, time_max_iso, max_results=15):
         start = event["start"].get("dateTime", event["start"].get("date"))
         lines.append(f"- {start}: {event.get('summary', '(no title)')}")
     return "\n".join(lines)
+
+
+def next_event(days_ahead=14):
+    """
+    Return {"summary": ..., "start": ...} for the soonest upcoming event, or
+    None if there isn't one in the window. Used by the web UI's status panel.
+    """
+    now = datetime.datetime.now().astimezone()
+    time_min = now.isoformat()
+    time_max = (now + datetime.timedelta(days=days_ahead)).isoformat()
+
+    service = get_service()
+    result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            maxResults=1,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    events = result.get("items", [])
+    if not events:
+        return None
+    event = events[0]
+    start = event["start"].get("dateTime", event["start"].get("date"))
+    return {"summary": event.get("summary", "(no title)"), "start": start}
