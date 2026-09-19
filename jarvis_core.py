@@ -90,6 +90,13 @@ BASE_SYSTEM_PROMPT = (
 
 EXIT_COMMANDS = {"quit", "exit"}
 
+# Only the last MAX_HISTORY_EXCHANGES exchanges (one of her messages plus
+# everything Jarvis did in answer to it, tool calls included) are SENT to the
+# API. Older ones stay in memory but stop costing input tokens on every
+# message. Set to None or 0 to send everything. Anything worth keeping past
+# that window belongs in the notes (remember / LOG).
+MAX_HISTORY_EXCHANGES = 10
+
 # --- Tools -------------------------------------------------------------
 # Two kinds, mixed in the same list:
 #  - "web_search" is a server tool: Anthropic runs it and resolves the result
@@ -519,6 +526,72 @@ def extract_text(response):
     )
 
 
+def _block_get(block, key):
+    """Blocks are SDK objects (assistant replies) or plain dicts (tool results)."""
+    if isinstance(block, dict):
+        return block.get(key)
+    return getattr(block, key, None)
+
+
+def _blocks(msg, *types):
+    content = msg["content"]
+    if isinstance(content, str):
+        return []
+    return [b for b in content if _block_get(b, "type") in types]
+
+
+def _is_user_text(msg):
+    """A real turn from her - not a user message that only carries tool_results."""
+    return msg["role"] == "user" and not _blocks(msg, "tool_result")
+
+
+def _history_is_consistent(msgs):
+    """The three rules the API enforces: starts with her text, every tool_use
+    answered by the very next message's tool_results (and vice versa), every
+    web_search call kept with its result."""
+    if not msgs or not _is_user_text(msgs[0]):
+        return False
+    for i, msg in enumerate(msgs):
+        if msg["role"] == "assistant":
+            use_ids = {_block_get(b, "id") for b in _blocks(msg, "tool_use")}
+            if use_ids:
+                nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+                if nxt is None or {_block_get(b, "tool_use_id") for b in _blocks(nxt, "tool_result")} != use_ids:
+                    return False
+            searched = {_block_get(b, "id") for b in _blocks(msg, "server_tool_use")}
+            answered = {_block_get(b, "tool_use_id") for b in _blocks(msg, "web_search_tool_result")}
+            if searched != answered:
+                return False
+        else:
+            result_ids = {_block_get(b, "tool_use_id") for b in _blocks(msg, "tool_result")}
+            if result_ids:
+                prev = msgs[i - 1] if i > 0 else None
+                if prev is None or prev["role"] != "assistant" or {_block_get(b, "id") for b in _blocks(prev, "tool_use")} != result_ids:
+                    return False
+    return True
+
+
+def trim_history(messages, max_exchanges=MAX_HISTORY_EXCHANGES):
+    """
+    The list to SEND to the API: the last `max_exchanges` exchanges, cut only
+    where one of her text messages begins. Returns a new list - `messages`
+    itself is never modified, so callers' indices and rollbacks stay valid.
+    If the cut would leave an inconsistent history, sends everything instead:
+    a costlier request beats a rejected one.
+    """
+    if max_exchanges is None or max_exchanges < 1:
+        return messages
+    starts = [i for i, msg in enumerate(messages) if _is_user_text(msg)]
+    if len(starts) <= max_exchanges:
+        return messages
+    trimmed = messages[starts[-max_exchanges]:]
+    if not _history_is_consistent(trimmed):
+        print("[history] could not trim safely - sending the full history", flush=True)
+        return messages
+    print(f"[history] sending last {max_exchanges} of {len(starts)} exchanges", flush=True)
+    return trimmed
+
+
 def call_claude(client, system_prompt, messages):
     """
     Call the API and resolve any custom tool calls until Claude is done.
@@ -534,7 +607,7 @@ def call_claude(client, system_prompt, messages):
             max_tokens=MAX_RESPONSE_TOKENS,
             system=system_prompt,
             tools=TOOLS,
-            messages=messages,
+            messages=trim_history(messages),
         )
         total_input += response.usage.input_tokens
         total_output += response.usage.output_tokens
