@@ -332,6 +332,15 @@ def _add_note(category, note):
     Path(NOTES_FILE).write_text(_serialize_notes(sections), encoding="utf-8")
 
 
+def _backup_sort_key(path):
+    """Ordering key for backups: mtime first (survives clock changes), then the
+    (stamp, counter) in the name, which never ties even when two copies land in
+    the same clock tick (Windows mtime resolution can be ~15 ms)."""
+    match = re.search(r"\.(\d{8}-\d{6})(?:-(\d+))?\.bak$", path.name)
+    stamp, counter = (match.group(1), int(match.group(2) or 0)) if match else ("", 0)
+    return (path.stat().st_mtime_ns, stamp, counter)
+
+
 def _backup_notes():
     """
     Copy notes.txt to notes.txt.YYYYMMDD-HHMMSS.bak before update_notes
@@ -355,7 +364,7 @@ def _backup_notes():
     # failure to delete an old copy must not block the update.
     backups = sorted(
         path.parent.glob(f"{path.name}.*.bak"),
-        key=lambda p: p.stat().st_mtime_ns,
+        key=_backup_sort_key,
         reverse=True,
     )
     for old in backups[NOTES_BACKUP_KEEP:]:
@@ -379,12 +388,15 @@ TAINT_FOLLOWING_MESSAGES = 1
 # Confirmation is checked by CODE against her own words, not just the model's
 # say-so. Deliberately strict: a wrongly refused "yes" only means she asks
 # again; a wrongly accepted one could save something she never approved.
-CONFIRM_MAX_WORDS = 8
-CONFIRM_WORDS = {"sim", "yes", "yep", "yeah", "salva", "salve", "salvar",
-                 "confirmo", "confirma", "confirmar", "confirm", "ok",
-                 "okay", "claro", "save"}
-# Only as complete expressions - "pode" and "isso" alone show up in questions.
-CONFIRM_PHRASES = ("pode salvar", "pode gravar", "isso mesmo")
+CONFIRM_MAX_WORDS = 5
+# A confirmation must be made ONLY of words from CONFIRM_VOCAB (so any extra
+# word - "e a prova de quando", "como" - makes it a different message), and
+# must contain a strong word or a complete phrase ("pode"/"isso"/"salvar"
+# alone show up in questions).
+CONFIRM_STRONG = {"sim", "yes", "yep", "yeah", "ok", "okay", "claro", "confirmo"}
+CONFIRM_VOCAB = CONFIRM_STRONG | {"confirm", "pode", "salvar", "salva", "salve", "gravar",
+                                  "isso", "mesmo", "it", "save", "please", "por", "favor"}
+CONFIRM_PHRASES = ("pode salvar", "pode gravar", "isso mesmo", "salva isso", "save it")
 NEGATION_WORDS = {"nao", "no", "not", "dont", "don't", "never", "nunca", "nem",
                   "cancela", "cancelar", "cancel", "pare", "stop"}
 _REPLY_HINT = re.compile(r"\s*\[Reply in [^\]]*\]\s*$")   # added by desktop.py, not spoken by her
@@ -441,9 +453,9 @@ def _describe_update(new_content):
 
 
 def _looks_like_yes(text):
-    """Short (<= CONFIRM_MAX_WORDS) message with a confirmation word or phrase,
-    no negation, no question mark. Fails safe: anything unclear -> False -> she
-    just asks again."""
+    """A short (<= CONFIRM_MAX_WORDS) message made ONLY of CONFIRM_VOCAB words,
+    with a strong word or a complete phrase, no negation, no question mark.
+    Fails safe: anything unclear -> False -> she just asks again."""
     text = _REPLY_HINT.sub("", text or "")
     text = unicodedata.normalize("NFKD", text)
     if "?" in text:
@@ -454,7 +466,9 @@ def _looks_like_yes(text):
         return False
     if any(w in NEGATION_WORDS for w in words):
         return False
-    if any(w in CONFIRM_WORDS for w in words):
+    if any(w not in CONFIRM_VOCAB for w in words):
+        return False
+    if any(w in CONFIRM_STRONG for w in words):
         return True
     padded = " " + " ".join(words) + " "
     return any(f" {phrase} " in padded for phrase in CONFIRM_PHRASES)
