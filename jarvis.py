@@ -35,7 +35,7 @@ def main():
     system_prompt = build_system_prompt()
 
     print("Jarvis (Level 2) - type 'quit' to exit.")
-    loaded = [f for f in CONTEXT_FILES if Path(f).exists()]
+    loaded = [f.name for f in CONTEXT_FILES if Path(f).exists()]
     if loaded:
         print(f"(context loaded from: {', '.join(loaded)})")
     print(f"(tools: {', '.join(t['name'] for t in TOOLS)})")

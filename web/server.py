@@ -55,6 +55,12 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/widget")
+def widget():
+    """Just the orb, sized to fit the small floating desktop widget window."""
+    return render_template("widget.html")
+
+
 @app.route("/status")
 def status():
     # Calendar is best-effort: a dashboard glitch here shouldn't break the page.

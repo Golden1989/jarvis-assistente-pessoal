@@ -108,7 +108,7 @@ function renderCalendar(nextEvent) {
 const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
 let listening = false;
-let sttLang = localStorage.getItem("jarvis-stt-lang") || "pt-BR";
+let sttLang = localStorage.getItem("jarvis-stt-lang") || "en-US";
 
 function updateLangButton() {
   langBtn.textContent = sttLang.startsWith("pt") ? "PT" : "EN";
@@ -272,6 +272,22 @@ form.addEventListener("submit", async (event) => {
 const orbCanvas = document.getElementById("orb-canvas");
 if (window.Orb && orbCanvas) {
   Orb.init(orbCanvas);
+}
+
+// ---------- Desktop widget mode (only present inside desktop.py's window) ----------
+
+const shrinkBtn = document.getElementById("shrink-btn");
+
+function setupShrinkButton() {
+  if (!shrinkBtn || !(window.pywebview && window.pywebview.api)) return;
+  shrinkBtn.hidden = false;
+  shrinkBtn.addEventListener("click", () => window.pywebview.api.shrink());
+}
+
+if (window.pywebview) {
+  setupShrinkButton();
+} else {
+  window.addEventListener("pywebviewready", setupShrinkButton);
 }
 
 refreshStatus();

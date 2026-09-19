@@ -5,24 +5,43 @@ Anything that isn't specific to how the user talks to Jarvis lives here:
 the system prompt, the tools, and the tool-use loop.
 """
 
+import base64
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
+
+from PIL import ImageGrab
 
 import google_calendar
 
 MODEL = "claude-sonnet-5"
 MAX_RESPONSE_TOKENS = 1024
 
+# Long-edge cap for screenshots sent to Claude. Oversized images inside a
+# tool_result are REJECTED by the API rather than auto-resized, so we shrink
+# them ourselves before sending. 1568px keeps us within the standard tier.
+MAX_SCREENSHOT_EDGE = 1568
+
 # claude-sonnet-5 pricing (US$ per million tokens).
 INPUT_PRICE = 2.0
 OUTPUT_PRICE = 10.0
+
+# Anchored to this file's own folder (the project root), NOT the current
+# working directory - desktop.py runs with its CWD inside web/, which made
+# plain relative filenames here silently resolve to the wrong place.
+_BASE_DIR = Path(__file__).resolve().parent
 
 # Optional local files with information for the system prompt. Kept out of Git.
 # notes.txt is special: Jarvis also WRITES to it via the "remember" and
 # "update_notes" tools, so facts you mention stick around across sessions,
 # organized under "## CATEGORY" headings.
-CONTEXT_FILES = ["personality.txt", "profile.txt", "people.txt", "notes.txt"]
-NOTES_FILE = "notes.txt"
+CONTEXT_FILES = [
+    _BASE_DIR / "personality.txt",
+    _BASE_DIR / "profile.txt",
+    _BASE_DIR / "people.txt",
+    _BASE_DIR / "notes.txt",
+]
+NOTES_FILE = _BASE_DIR / "notes.txt"
 NOTE_CATEGORIES = ["projects", "exams", "preferences", "personal", "log"]
 
 # Folder Jarvis is allowed to look into with list_files/read_file. Deliberately
@@ -200,6 +219,19 @@ TOOLS = [
             "required": ["days_ahead"],
         },
     },
+    {
+        "name": "look_at_screen",
+        "description": (
+            "Take a screenshot of the user's entire screen right now and "
+            "look at it. Only call this when she explicitly asks you to "
+            "look at her screen or look at something on it - never on your "
+            "own initiative."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 ]
 
 MAX_FILE_CHARS = 5000  # cap what a single read_file call can pull into context
@@ -249,6 +281,21 @@ def _add_note(category, note):
     timestamp = datetime.now().strftime("%Y-%m-%d")
     sections[category].append(f"- [{timestamp}] {note}")
     Path(NOTES_FILE).write_text(_serialize_notes(sections), encoding="utf-8")
+
+
+def _capture_screen():
+    """
+    Grab a screenshot of the whole screen, downscaled to fit MAX_SCREENSHOT_EDGE.
+    Returns a dict describing an image (never a plain string) - call_claude()
+    checks for this shape and wraps it as an image content block instead of
+    plain text in the tool_result.
+    """
+    image = ImageGrab.grab(all_screens=True)  # every monitor, not just the primary one
+    image.thumbnail((MAX_SCREENSHOT_EDGE, MAX_SCREENSHOT_EDGE))  # keeps aspect ratio
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    data = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {"type": "image", "media_type": "image/png", "data": data}
 
 
 def _resolve_within_allowed(relative_path):
@@ -325,18 +372,24 @@ def run_tool(name, tool_input):
         except Exception as error:
             return f"Failed to list events: {error}"
 
+    if name == "look_at_screen":
+        try:
+            return _capture_screen()
+        except Exception as error:
+            return f"Failed to capture the screen: {error}"
+
     return f"Unknown tool: {name}"
 
 
 def build_system_prompt():
     """Combine the base identity with any local context files that exist."""
     prompt = BASE_SYSTEM_PROMPT
-    for filename in CONTEXT_FILES:
-        path = Path(filename)
+    for path in CONTEXT_FILES:
+        path = Path(path)
         if path.exists():
             content = path.read_text(encoding="utf-8").strip()
             if content:
-                prompt += f"\n\n# {filename}\n" + content
+                prompt += f"\n\n# {path.name}\n" + content
     return prompt
 
 
@@ -382,8 +435,24 @@ def call_claude(client, system_prompt, messages):
         for block in response.content:
             if block.type == "tool_use":
                 result = run_tool(block.name, block.input)
+                # Most tools return plain text. look_at_screen returns an
+                # image dict instead (see _capture_screen) - wrap it as an
+                # image content block rather than stringifying it.
+                if isinstance(result, dict) and result.get("type") == "image":
+                    content = [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": result["media_type"],
+                                "data": result["data"],
+                            },
+                        }
+                    ]
+                else:
+                    content = result
                 tool_results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                    {"type": "tool_result", "tool_use_id": block.id, "content": content}
                 )
 
         messages.append({"role": "user", "content": tool_results})

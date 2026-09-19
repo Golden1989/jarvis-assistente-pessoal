@@ -55,11 +55,39 @@ when one fires), and your next Google Calendar event; the activity log
 doubles as the conversation. Both UIs share the same brain (`jarvis_core.py`)
 and tools; use whichever you're in the mood for.
 
-**Voice (web UI only):** the mic button uses your browser's built-in speech
-recognition (free, Chrome/Edge) - toggle PT/EN next to it to match what
-you're about to say. Jarvis speaks replies back with the browser's built-in
-text-to-speech, auto-picking the voice language from the reply. Mute with
-the speaker icon. No paid API involved on either side.
+**Desktop widget:**
+
+```
+python web/desktop.py
+```
+
+Runs the same server, but shows Jarvis as a small always-on-top floating
+orb (draggable) instead of opening a browser tab - click it to expand into
+the full dashboard, click the "-" in the dashboard's top bar to shrink back
+down. Useful so the dashboard itself doesn't get in the way when you ask
+Jarvis to look at your screen. Needs `pywebview` (in `requirements.txt`).
+
+Also listens for **"Hey Jarvis"** in the background - fully local (see
+"Wake word" below) - and runs a full spoken back-and-forth once it hears it,
+no clicking anything.
+
+**Voice, in the browser tab / dashboard:** the mic button uses your
+browser's built-in speech recognition (free, Chrome/Edge) - toggle PT/EN
+next to it to match what you're about to say. Jarvis speaks replies back
+with the browser's built-in text-to-speech, auto-picking the voice language
+from the reply. Mute with the speaker icon. No paid API involved on either
+side.
+
+**Wake word, in the desktop widget:** "Hey Jarvis" detection runs locally
+via `openWakeWord` (`web/wake_word.py`) - no account, no cloud, audio is
+scored in memory and discarded. The browser's speech *recognition* doesn't
+work inside the embedded widget window (it needs a Google service that
+embedded browsers can't reach), so once woken, your actual question is
+transcribed locally too, with `faster-whisper` (`web/voice_capture.py`,
+auto-detects English/Portuguese). Only the reply is spoken through the
+browser (speech *synthesis* works fine there). After replying, it keeps
+listening for a follow-up for about 90 seconds before going back to sleep -
+say "Hey Jarvis" again any time to wake it back up.
 
 ### Optional personal context
 
@@ -99,6 +127,10 @@ All four are loaded into the system prompt at startup.
   on your real Google Calendar (see setup below). Reminders come for free
   from whatever default notification settings you already have on Google
   Calendar - Jarvis doesn't need to manage those itself.
+- `look_at_screen` — takes one screenshot of your whole screen when you
+  explicitly ask ("look at my screen", "look at this"), never on its own.
+  Resized before sending so it stays within Claude's image limits; nothing
+  is saved to disk, and Anthropic doesn't retain or train on the image.
 
 ### Google Calendar setup (one-time)
 
@@ -124,14 +156,16 @@ passwords; they grant access to your real calendar.
 
 - `jarvis_core.py` — the shared brain: system prompt, tools, tool-use loop.
 - `jarvis.py` — terminal UI.
-- `web/` — web UI (Flask + an animated orb): `server.py`, `templates/index.html`,
-  `static/style.css`, `static/app.js`.
+- `web/` — web UI: `server.py` (Flask), `desktop.py` (floating widget +
+  wake word entry point), `wake_word.py` (local "Hey Jarvis" detection),
+  `voice_capture.py` (local speech-to-text for the widget), `templates/`,
+  `static/` (`app.js`, `widget.js`, `orb.js`, `style.css`).
 - `google_calendar.py` / `calendar_login.py` — Google Calendar integration.
 
 ## Roadmap
 
-- **Voice:** browser speech-to-text for input and text-to-speech for output
-  on the web UI, with the orb reacting to the audio.
-- **Level 3:** broader, permissioned actions (create/edit/organize files,
-  run programs/scripts, install things - with confirmation before anything
-  that executes or changes the system) and richer persistent memory.
+- Broader, permissioned actions (create/edit/organize files, run
+  programs/scripts, install things - with confirmation before anything that
+  executes or changes the system).
+- Window shaped like an actual circle (not just a square panel) for the
+  widget, via Windows-specific window-region clipping.

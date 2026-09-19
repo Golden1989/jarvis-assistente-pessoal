@@ -8,6 +8,7 @@ don't need to log in again.
 
 import datetime
 import os.path
+from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -17,8 +18,12 @@ from googleapiclient.discovery import build
 # Read/write access to events only - not full calendar management (least privilege).
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 
-CREDENTIALS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
+# Anchored to this file's own folder (the project root), NOT the current
+# working directory - desktop.py runs with its CWD inside web/, which made
+# these unreachable with plain relative paths.
+_BASE_DIR = Path(__file__).resolve().parent
+CREDENTIALS_FILE = str(_BASE_DIR / "credentials.json")
+TOKEN_FILE = str(_BASE_DIR / "token.json")
 
 # Local timezone used for events you create. Change if you're not in Brazil.
 TIMEZONE = "America/Sao_Paulo"
