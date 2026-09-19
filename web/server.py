@@ -19,12 +19,12 @@ import anthropic
 from flask import Flask, jsonify, render_template, request
 
 import google_calendar
-from jarvis_core import INPUT_PRICE, OUTPUT_PRICE, TOOLS, build_system_prompt, call_claude, extract_text
+from jarvis_core import INPUT_PRICE, OUTPUT_PRICE, TOOLS, SystemPromptProvider, call_claude, extract_text
 
 app = Flask(__name__)
 
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment - never sent to the browser
-system_prompt = build_system_prompt()
+prompts = SystemPromptProvider()  # notes.txt is re-checked on every request
 
 messages = []  # the conversation history, shared by every request (single user)
 totals = {"input_tokens": 0, "output_tokens": 0}
@@ -92,7 +92,7 @@ def chat():
     messages.append({"role": "user", "content": user_input})
 
     try:
-        response, in_tokens, out_tokens = call_claude(client, system_prompt, messages)
+        response, in_tokens, out_tokens = call_claude(client, prompts.get(), messages)
     except anthropic.APIError as error:
         del messages[checkpoint:]
         return jsonify({"error": str(error)}), 502

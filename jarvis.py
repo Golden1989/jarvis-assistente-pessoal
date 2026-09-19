@@ -14,7 +14,7 @@ from jarvis_core import (
     INPUT_PRICE,
     OUTPUT_PRICE,
     TOOLS,
-    build_system_prompt,
+    SystemPromptProvider,
     call_claude,
     extract_text,
 )
@@ -32,7 +32,7 @@ def main():
     input_tokens = 0     # running totals to track session spend
     output_tokens = 0
 
-    system_prompt = build_system_prompt()
+    prompts = SystemPromptProvider()  # notes.txt is re-checked on every message
 
     print("Jarvis (Level 2) - type 'quit' to exit.")
     loaded = [f.name for f in CONTEXT_FILES if Path(f).exists()]
@@ -57,7 +57,7 @@ def main():
         messages.append({"role": "user", "content": user_input})
 
         try:
-            response, in_tokens, out_tokens = call_claude(client, system_prompt, messages)
+            response, in_tokens, out_tokens = call_claude(client, prompts.get(), messages)
         except anthropic.APIError as error:
             print(f"\n[API call failed: {error}]\n")
             del messages[checkpoint:]

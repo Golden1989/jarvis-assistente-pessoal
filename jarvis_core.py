@@ -448,16 +448,68 @@ def run_tool(name, tool_input):
     return f"Unknown tool: {name}"
 
 
-def build_system_prompt():
-    """Combine the base identity with any local context files that exist."""
+def _context_section(path):
+    """One context file as a '# name' section, or '' if missing/empty."""
+    path = Path(path)
+    if path.exists():
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            return f"\n\n# {path.name}\n" + content
+    return ""
+
+
+def build_fixed_prompt():
+    """Base identity + every context file EXCEPT notes.txt. Read once at
+    startup: personality/profile/people only change when she edits them by hand."""
     prompt = BASE_SYSTEM_PROMPT
     for path in CONTEXT_FILES:
-        path = Path(path)
-        if path.exists():
-            content = path.read_text(encoding="utf-8").strip()
-            if content:
-                prompt += f"\n\n# {path.name}\n" + content
+        if Path(path) != Path(NOTES_FILE):
+            prompt += _context_section(path)
     return prompt
+
+
+def build_notes_section():
+    """The notes.txt section on its own - the only part Jarvis itself changes."""
+    return _context_section(NOTES_FILE)
+
+
+def build_system_prompt():
+    """Combine the base identity with any local context files that exist."""
+    return build_fixed_prompt() + build_notes_section()
+
+
+def _notes_stamp():
+    """Cheap change detector for notes.txt: (mtime_ns, size), None if missing."""
+    try:
+        stat = Path(NOTES_FILE).stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+class SystemPromptProvider:
+    """
+    Hands out the system prompt, reloading only the notes when notes.txt
+    changed on disk (remember/update_notes, or a manual edit) - no restart.
+    `fixed` and `notes` stay separate attributes so a future prompt cache can
+    put the stable part first and only the notes invalidate it.
+    """
+
+    def __init__(self):
+        self.fixed = build_fixed_prompt()
+        self.notes = ""
+        self._stamp = "unloaded"  # never equals a real stamp, so the first get() loads
+
+    def get(self):
+        stamp = _notes_stamp()
+        if stamp != self._stamp:
+            try:
+                self.notes = build_notes_section()
+                self._stamp = stamp
+            except Exception as error:
+                # Unreadable right now: keep the last good notes, retry next request.
+                print(f"[prompt] could not reload notes.txt: {error}", flush=True)
+        return self.fixed + self.notes
 
 
 def extract_text(response):
