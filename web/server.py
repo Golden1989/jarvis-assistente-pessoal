@@ -19,7 +19,7 @@ import anthropic
 from flask import Flask, jsonify, render_template, request
 
 import google_calendar
-from jarvis_core import INPUT_PRICE, OUTPUT_PRICE, TOOLS, SystemPromptProvider, call_claude, extract_text
+from jarvis_core import INPUT_PRICE, OUTPUT_PRICE, TOOLS, SystemPromptProvider, call_claude, extract_text, memory_notice
 
 app = Flask(__name__)
 
@@ -104,7 +104,7 @@ def chat():
 
     return jsonify(
         {
-            "reply": extract_text(response),
+            "reply": "\n\n".join(filter(None, [extract_text(response), memory_notice()])),
             "tools_used": tools_used,
             "turn_tokens": in_tokens + out_tokens,
             "session_cost": _session_cost(),

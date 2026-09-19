@@ -17,6 +17,7 @@ from jarvis_core import (
     SystemPromptProvider,
     call_claude,
     extract_text,
+    memory_notice,
 )
 
 
@@ -64,6 +65,7 @@ def main():
             continue
 
         text = extract_text(response)
+        text = "\n\n".join(filter(None, [text, memory_notice()]))
         print(f"\nJarvis: {text}\n")
 
         # Update and show the running session spend (tokens only - web
