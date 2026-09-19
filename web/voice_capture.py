@@ -20,9 +20,9 @@ CHUNK_SIZE = 1280
 MAX_SECONDS = 15          # give up listening after this long regardless
 GRACE_SECONDS = 3.0       # give up quickly if she never actually starts talking
 SILENCE_SECONDS = 1.2     # how much quiet after speech means "she's done"
-SILENCE_THRESHOLD = 120   # mean amplitude below this counts as silence - low,
-# since the laptop's raw array-mic signal (no headset) turned out much
-# quieter than a typical headset mic once downmixed to mono ourselves
+SILENCE_THRESHOLD = 25    # mean amplitude below this counts as silence (was 120) -
+# measured on the laptop mic without a headset: noise floor ~0.2, normal speech
+# averages ~68, so 25 sits between the two
 
 _model = None
 

@@ -24,7 +24,10 @@ from audio_utils import pick_channels
 
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1280  # 80ms at 16kHz - openWakeWord's recommended frame size
-THRESHOLD = 0.5
+THRESHOLD = 0.35  # score above this wakes Jarvis (was 0.5 - real "Hey Jarvis" scores
+# from the laptop mic mostly landed at 0.30-0.49 in mic_diagnostic.py)
+LOG_THRESHOLD = 0.2  # every score above this is logged, even without triggering,
+# so THRESHOLD can be calibrated by looking at the near-misses
 COOLDOWN_SECONDS = 2.0  # ignore further detections briefly after one fires,
 # so trailing audio from the same utterance can't trigger it again
 RESUME_DISCARD_CHUNKS = 25  # ~2s of audio to throw away right after the mic
@@ -92,8 +95,9 @@ def listen_forever(on_wake):
             prediction = model.predict(audio)
             score = prediction.get("hey_jarvis", 0.0)
 
+            if score > LOG_THRESHOLD:
+                print(f"[wake_word] score={score:.2f} (trigger threshold={THRESHOLD})", flush=True)
             if score > THRESHOLD:
-                print(f"[wake_word] score={score:.2f} (threshold={THRESHOLD})", flush=True)
                 if (time.monotonic() - last_trigger) > COOLDOWN_SECONDS:
                     last_trigger = time.monotonic()
                     print("[wake_word] TRIGGERED - calling on_wake()", flush=True)

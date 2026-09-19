@@ -14,6 +14,7 @@ profile.txt
 perfil.txt
 people.txt
 notes.txt
+notes.txt.*.bak
 
 # Google Calendar OAuth secrets - as sensitive as a password, NEVER commit
 credentials.json
