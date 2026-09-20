@@ -8,6 +8,7 @@ the system prompt, the tools, and the tool-use loop.
 import base64
 import re
 import shutil
+import threading
 import time
 import unicodedata
 from datetime import datetime, timedelta
@@ -17,6 +18,43 @@ from pathlib import Path
 from PIL import ImageGrab
 
 import google_calendar
+
+# --- Modes: everything you may want to tweak lives in these tables ---------
+MODES = {
+    "normal":  {"model": "claude-sonnet-5", "input_price": 2.0, "output_price": 10.0,
+                "max_tokens": 2048, "effort": None},
+    "serious": {"model": "claude-opus-5",   "input_price": 5.0, "output_price": 25.0,
+                "max_tokens": 4096, "effort": None},
+}   # prices: US$ per million tokens; effort None = the API's default (high)
+DEFAULT_MODE = "normal"
+FALLBACK_MODE = "normal"        # where a refused request is retried, once
+SERIOUS_IDLE_MINUTES = 15       # serious mode switches itself off after this much silence
+COST_ALERT_USD = 0.50           # session-cost warning, repeated at every multiple of this
+
+# Fixed replies for mode commands - no API call. (action, language) -> text.
+MODE_REPLIES = {
+    ("serious", "en"): "Serious mode activating.",
+    ("serious", "pt"): "Modo sério ativado.",
+    ("normal", "en"): "Back to normal.",
+    ("normal", "pt"): "Modo normal.",
+}
+# Trigger phrases, already normalized (lowercase, no accents, no punctuation).
+# The language of the phrase that fired picks the reply language above.
+MODE_TRIGGERS = {
+    ("serious", "en"): ("serious mode",),
+    ("serious", "pt"): ("modo serio",),
+    ("normal", "en"): ("back to normal", "normal mode"),
+    ("normal", "pt"): ("modo normal",),
+}
+MODE_MAX_WORDS = 6         # a command must be a short message...
+MODE_MAX_EXTRA_WORDS = 3   # ...with at most this many words besides the trigger
+# Serious trigger + any of these = leave serious mode, never enter it.
+MODE_EXIT_WORDS = {"desativa", "desativar", "sai", "sair", "saia", "exit", "leave",
+                   "off", "stop", "cancel", "cancela", "pare", "disable"}
+# Any of these anywhere = a question or a negation, not a command.
+# (Portuguese "no" = "in the" is caught too: say "ativa o modo serio", not "entra no modo serio".)
+MODE_BLOCK_WORDS = {"nao", "no", "dont", "never", "nunca", "que", "what", "como", "how",
+                    "why", "porque", "qual", "explica", "explain", "significa", "mean"}
 
 MODEL = "claude-sonnet-5"
 MAX_RESPONSE_TOKENS = 1024
@@ -600,6 +638,160 @@ _guard = MemoryGuard()   # one user, one session - same assumption as server.py'
 
 def memory_notice():
     return _guard.notice()
+
+
+def _mode_words(text):
+    """Her message as normalized words (reply hint removed, lowercase, no
+    accents, punctuation or apostrophes), or None if it has a question mark."""
+    text = unicodedata.normalize("NFKD", _REPLY_HINT.sub("", text or ""))
+    if "?" in text:
+        return None
+    text = text.encode("ascii", "ignore").decode().lower().replace("'", "")
+    return re.findall(r"[a-z0-9]+", text)
+
+
+def detect_mode_command(text):
+    """
+    ('serious' | 'normal', 'en' | 'pt') when the message is a mode command,
+    else None. Runs on HER typed/spoken text only - never on tool or web
+    results - and before any API call. No 'jarvis' needed (Whisper mishears it).
+    A serious trigger together with an exit word means LEAVE serious mode.
+    """
+    words = _mode_words(text)
+    if not words or len(words) > MODE_MAX_WORDS:
+        return None
+    if any(w in MODE_BLOCK_WORDS for w in words):
+        return None
+    hits = set()
+    for key, phrases in MODE_TRIGGERS.items():
+        for phrase in phrases:
+            parts = phrase.split()
+            n = len(parts)
+            found = any(words[i:i + n] == parts for i in range(len(words) - n + 1))
+            if found and len(words) - n <= MODE_MAX_EXTRA_WORDS:
+                hits.add(key)
+    if len(hits) != 1:   # nothing, or ambiguous
+        return None
+    action, lang = next(iter(hits))
+    if action == "serious" and any(w in MODE_EXIT_WORDS for w in words):
+        action = "normal"
+    return (action, lang)
+
+
+def mode_reply(command):
+    return MODE_REPLIES[command]
+
+
+class ModeState:
+    """
+    Current mode, idle timer, and per-model session cost. Lives in server.py
+    (so the dashboard and the voice widget share it) and in jarvis.py. Mode
+    commands never touch MemoryGuard: they are not rounds.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.mode = DEFAULT_MODE
+        self.last_used = self._clock()
+        self._reverted = False
+        self.costs = {}          # model id -> {"input_tokens", "output_tokens", "cost"}
+        self._next_alert = COST_ALERT_USD
+
+    def _expire(self):
+        if self.mode == "serious" and self._clock() - self.last_used >= SERIOUS_IDLE_MINUTES * 60:
+            self.mode = DEFAULT_MODE
+            self._reverted = True
+            print("[mode] serious mode switched off after idle time", flush=True)
+
+    def current(self):
+        with self._lock:
+            self._expire()
+            return self.mode
+
+    def set_mode(self, mode):
+        with self._lock:
+            self.mode = mode
+            self.last_used = self._clock()
+            self._reverted = False
+            print(f"[mode] now {mode} ({MODES[mode]['model']})", flush=True)
+
+    def touch(self):
+        with self._lock:
+            self._expire()
+            self.last_used = self._clock()
+
+    def seconds_left(self):
+        """Seconds until serious mode switches itself off; None when not in serious."""
+        with self._lock:
+            self._expire()
+            if self.mode != "serious":
+                return None
+            return max(0, SERIOUS_IDLE_MINUTES * 60 - (self._clock() - self.last_used))
+
+    def take_reverted_notice(self):
+        """True once after an idle switch-off, so the next reply can say so."""
+        with self._lock:
+            flag, self._reverted = self._reverted, False
+            return flag
+
+    def add_usage(self, model, input_tokens, output_tokens):
+        """
+        Adds one API response's usage at THAT model's price. Call it for every
+        response, refusals included: whatever the response reports is counted
+        (a missing field counts as 0, but nothing is assumed zero otherwise).
+        The docs say a refusal before any output is not charged, so this may
+        run slightly above the real bill - deliberately conservative.
+        Unknown model: charged at the highest known price, with a warning.
+        """
+        prices = {m["model"]: m for m in MODES.values()}
+        entry = prices.get(model)
+        if entry is None:
+            print(f"[mode] unknown model {model!r} in usage - charging the highest known price", flush=True)
+            entry = {"input_price": max(m["input_price"] for m in MODES.values()),
+                     "output_price": max(m["output_price"] for m in MODES.values())}
+        n_in, n_out = int(input_tokens or 0), int(output_tokens or 0)
+        cost = n_in / 1_000_000 * entry["input_price"] + n_out / 1_000_000 * entry["output_price"]
+        with self._lock:
+            row = self.costs.setdefault(model, {"input_tokens": 0, "output_tokens": 0, "cost": 0.0})
+            row["input_tokens"] += n_in
+            row["output_tokens"] += n_out
+            row["cost"] += cost
+        return cost
+
+    def total_cost(self):
+        with self._lock:
+            return sum(r["cost"] for r in self.costs.values())
+
+    def take_cost_alert(self):
+        """The threshold just crossed (0.50, 1.00, ...) once per step, else None.
+        A turn that jumps several steps alerts once, at the highest."""
+        with self._lock:
+            total = round(sum(r["cost"] for r in self.costs.values()), 6)
+            if total + 1e-9 < self._next_alert:
+                return None
+            steps = int(total / COST_ALERT_USD + 1e-9)
+            self._next_alert = (steps + 1) * COST_ALERT_USD
+            return round(steps * COST_ALERT_USD, 2)
+
+    def snapshot(self):
+        """Everything /status needs about mode and cost."""
+        mode = self.current()
+        with self._lock:
+            by_model = {m: {**r, "cost": round(r["cost"], 6)} for m, r in self.costs.items()}
+        return {
+            "mode": mode,
+            "model": MODES[mode]["model"],
+            "serious_seconds_left": self.seconds_left(),
+            "input_tokens": sum(r["input_tokens"] for r in by_model.values()),
+            "output_tokens": sum(r["output_tokens"] for r in by_model.values()),
+            "cost": round(sum(r["cost"] for r in by_model.values()), 4),
+            "by_model": by_model,
+            "cost_alert_step": COST_ALERT_USD,
+        }
 
 
 def _capture_screen():
