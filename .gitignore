@@ -23,6 +23,9 @@ token.json
 # Local editor config (contains machine-specific paths)
 .vscode/
 
+# App log (rotating, written by web/app_log.py)
+logs/
+
 # Operating system
 .DS_Store
 Thumbs.db

@@ -20,6 +20,7 @@ import anthropic
 from flask import Flask, jsonify, render_template, request
 
 import google_calendar
+import wake_health
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
     CallInfo, ModeState, ModelRefusedError, SystemPromptProvider,
@@ -87,6 +88,7 @@ def status():
             "cost_alert_step": snap["cost_alert_step"],
             "session": {k: snap[k] for k in ("input_tokens", "output_tokens", "cost", "by_model")},
             "next_event": upcoming,
+            "wake_word": wake_health.snapshot(),
         }
     )
 

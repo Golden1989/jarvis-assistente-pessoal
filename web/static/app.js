@@ -115,6 +115,16 @@ function addLog(who, text) {
   log.scrollTop = log.scrollHeight;
 }
 
+// The wake-word listener restarts itself when the microphone misbehaves; if it keeps doing so, say it once.
+let wakeWarned = false;
+function renderWakeHealth(info) {
+  const unstable = !!(info && info.unstable);
+  if (unstable && !wakeWarned) {
+    addLog("system", `wake word unstable: restarted ${info.restarts_last_minute} times in the last minute (see logs/jarvis.log)`);
+  }
+  wakeWarned = unstable;
+}
+
 function renderTools() {
   toolListEl.innerHTML = "";
   toolNames.forEach((name) => {
@@ -293,6 +303,7 @@ async function refreshStatus({ quiet = false } = {}) {
     renderCostModels(data.session.by_model);
     setMode(data.mode, data.model, data.serious_seconds_left);
     renderCalendar(data.next_event);
+    renderWakeHealth(data.wake_word);
   } catch (error) {
     if (!quiet) addLog("system", `status check failed: ${error}`);
   } finally {

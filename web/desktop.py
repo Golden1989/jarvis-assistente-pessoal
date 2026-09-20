@@ -30,10 +30,11 @@ import webview
 # would otherwise crash this whole background thread mid-conversation.
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+import app_log
 import voice_capture
 import wake_word
 from server import app
-from jarvis_core import CONFIRM_STRONG, REPLY_LANGUAGE, detect_mode_command
+from jarvis_core import REPLY_LANGUAGE
 
 SERVER_URL = "http://127.0.0.1:5000"
 
@@ -46,13 +47,11 @@ CONVERSATION_WINDOW_SECONDS = 90  # how long to keep listening for a follow-up
 CHAT_TIMEOUT_SECONDS = 180  # was 90: /chat is serialized now, and a serious (Opus) turn with tools can take longer
 MODE_POLL_SECONDS = 30  # how often the watcher asks /mode, to catch the idle switch-off
 MAX_NOISE_IN_A_ROW = 3  # this many ignored "transcriptions" in a row end the conversation
-# What Whisper tends to invent out of silence or background noise. Whole utterance only.
+# What Whisper tends to invent out of silence or background noise. Whole utterance only: any other
+# text, even one word ("weather", "yes", "no"), goes through to Jarvis.
 NOISE_PHRASES = {"you", "bye", "bye bye", "thank you", "thanks for watching", "thank you for watching",
                  "thank you very much", "blank audio", "music", "applause", "silence",
                  "obrigado", "obrigada", "tchau"}
-# Short answers she really says: a lone word from this list always goes through to Jarvis.
-SHORT_ANSWERS = {"yes", "yeah", "yep", "ok", "okay", "sure", "no", "nope", "stop", "cancel", "confirm",
-                 "save", "hello", "hi", "thanks"}
 
 _window = None  # set once create_window() runs, used by Api below
 _screen_size = None  # (width, height), computed once on the main thread
@@ -114,16 +113,12 @@ def _wait_for_server(timeout=10):
 
 
 def _is_noise(text):
-    """True for what Whisper invents from silence/noise: a typical phrase, or a single word that is
-    neither a short answer (SHORT_ANSWERS), a confirmation (CONFIRM_STRONG) nor a mode command.
-    Empty text is handled by the caller ("heard nothing")."""
+    """True for what Whisper invents from silence/noise: no words at all, or exactly one of the
+    NOISE_PHRASES. Anything else is a real utterance."""
     words = re.findall(r"[a-z0-9']+", (text or "").lower())
     if not words:
         return True
-    if " ".join(words) in NOISE_PHRASES:
-        return True
-    return (len(words) == 1 and words[0] not in SHORT_ANSWERS and words[0] not in CONFIRM_STRONG
-            and detect_mode_command(text) is None)
+    return " ".join(words) in NOISE_PHRASES
 
 
 def _time_greeting(lang):
@@ -293,6 +288,8 @@ def _on_wake_word():
 
 def main():
     global _screen_size
+    app_log.setup()  # logs/jarvis.log: the console does not exist under pythonw
+    print("[desktop] starting", flush=True)
     root = tk.Tk()  # computed once, here, on the main thread
     _screen_size = (root.winfo_screenwidth(), root.winfo_screenheight())
     root.destroy()
