@@ -8,6 +8,7 @@ person talking to their own assistant on their own machine.
 """
 
 import sys
+import threading
 import webbrowser
 from pathlib import Path
 
@@ -19,7 +20,12 @@ import anthropic
 from flask import Flask, jsonify, render_template, request
 
 import google_calendar
-from jarvis_core import INPUT_PRICE, OUTPUT_PRICE, TOOLS, SystemPromptProvider, call_claude, extract_text, memory_notice
+from jarvis_core import (
+    FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
+    CallInfo, ModeState, ModelRefusedError, SystemPromptProvider,
+    call_claude, compose_reply, detect_mode_command, message_language,
+    mode_reply, refusal_reply,
+)
 
 app = Flask(__name__)
 
@@ -27,7 +33,11 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment -
 prompts = SystemPromptProvider()  # notes.txt is re-checked on every request
 
 messages = []  # the conversation history, shared by every request (single user)
-totals = {"input_tokens": 0, "output_tokens": 0}
+mode_state = ModeState()  # mode, idle timer and per-model cost: shared by the dashboard and the voice widget
+# ONE message at a time: mode, cost, MemoryGuard and `messages` are shared state.
+# /status deliberately does NOT take this lock (and never calls touch()), so it
+# still answers while a long Opus reply is running and can't keep serious mode alive.
+chat_lock = threading.Lock()
 
 
 def _tools_used_since(start_index):
@@ -42,12 +52,10 @@ def _tools_used_since(start_index):
     return names
 
 
-def _session_cost():
-    return round(
-        totals["input_tokens"] / 1_000_000 * INPUT_PRICE
-        + totals["output_tokens"] / 1_000_000 * OUTPUT_PRICE,
-        4,
-    )
+def _payload(reply, **extra):
+    snap = mode_state.snapshot()
+    return {"reply": reply, "mode": snap["mode"], "model": snap["model"],
+            "session_cost": snap["cost"], "tools_used": [], "turn_tokens": 0, **extra}
 
 
 @app.route("/")
@@ -69,14 +77,15 @@ def status():
     except Exception:
         upcoming = None
 
+    snap = mode_state.snapshot()  # no chat_lock, no touch()
     return jsonify(
         {
             "tools": [t["name"] for t in TOOLS],
-            "session": {
-                "input_tokens": totals["input_tokens"],
-                "output_tokens": totals["output_tokens"],
-                "cost": _session_cost(),
-            },
+            "mode": snap["mode"],
+            "model": snap["model"],
+            "serious_seconds_left": snap["serious_seconds_left"],
+            "cost_alert_step": snap["cost_alert_step"],
+            "session": {k: snap[k] for k in ("input_tokens", "output_tokens", "cost", "by_model")},
             "next_event": upcoming,
         }
     )
@@ -87,29 +96,52 @@ def chat():
     user_input = (request.json or {}).get("message", "").strip()
     if not user_input:
         return jsonify({"error": "empty message"}), 400
+    with chat_lock:
+        return _chat(user_input)
+
+
+def _chat(user_input):
+    lang = message_language(user_input)
+
+    # Mode commands: her own words only, BEFORE anything is appended to the
+    # history and before MemoryGuard's begin_round. Fixed reply, no API call.
+    # set_mode restarts the idle timer, so a command counts as use.
+    command = detect_mode_command(user_input)
+    if command is not None:
+        mode_state.set_mode(command[0])
+        return jsonify(_payload(mode_reply(command), fixed=True))
+
+    mode_state.touch()  # expires an idle serious mode first, then counts as use
+    mode = mode_state.current()
+    idle_notice = None
+    if mode_state.take_reverted_notice():
+        idle_notice = NOTICES["idle_revert"][lang].format(minutes=SERIOUS_IDLE_MINUTES)
 
     checkpoint = len(messages)
     messages.append({"role": "user", "content": user_input})
-
+    info = CallInfo()
     try:
-        response, in_tokens, out_tokens = call_claude(client, prompts.get(), messages)
+        response, in_tokens, out_tokens = call_claude(
+            client, prompts.get(), messages, mode=mode, state=mode_state, info=info)
+    except ModelRefusedError as refusal:
+        del messages[checkpoint:]  # the refused message leaves the history; the mode does not change
+        return jsonify(_payload(refusal_reply(lang, mode_state, info), refused=True,
+                                refusal_category=refusal.category, fallback=info.fallback))  # HTTP 200: the voice speaks it
     except anthropic.APIError as error:
-        del messages[checkpoint:]
+        del messages[checkpoint:]  # unchanged behavior: undo the message
         return jsonify({"error": str(error)}), 502
+    except BaseException:
+        del messages[checkpoint:]  # anything unexpected: the history stays consistent, Flask reports it
+        raise
 
-    tools_used = _tools_used_since(checkpoint + 1)
-
-    totals["input_tokens"] += in_tokens
-    totals["output_tokens"] += out_tokens
-
-    return jsonify(
-        {
-            "reply": "\n\n".join(filter(None, [extract_text(response), memory_notice()])),
-            "tools_used": tools_used,
-            "turn_tokens": in_tokens + out_tokens,
-            "session_cost": _session_cost(),
-        }
-    )
+    if info.fallback:
+        mode_state.set_mode(FALLBACK_MODE)  # D1: the fallback answered, so stay on the model that accepted
+    reply = compose_reply(response, info, lang, mode_state)  # the ONLY source of the memory notice
+    if idle_notice:
+        reply = f"{idle_notice}\n\n{reply}"
+    return jsonify(_payload(reply, tools_used=_tools_used_since(checkpoint + 1),
+                            turn_tokens=in_tokens + out_tokens,
+                            fallback=info.fallback, truncated=info.truncated))
 
 
 if __name__ == "__main__":

@@ -97,10 +97,6 @@ ACTION_SUCCESS = {
 # them ourselves before sending. 1568px keeps us within the standard tier.
 MAX_SCREENSHOT_EDGE = 1568
 
-# Legacy aliases (normal-mode prices, US$ per million tokens); dropped in stage 3.
-INPUT_PRICE = MODES[DEFAULT_MODE]["input_price"]
-OUTPUT_PRICE = MODES[DEFAULT_MODE]["output_price"]
-
 # Anchored to this file's own folder (the project root), NOT the current
 # working directory - desktop.py runs with its CWD inside web/, which made
 # plain relative filenames here silently resolve to the wrong place.

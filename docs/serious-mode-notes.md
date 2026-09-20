@@ -68,3 +68,13 @@ As documented, this is not enforced for `claude-opus-5` / `claude-sonnet-5`
   `usage.output_tokens_details.thinking_tokens` shows how many.
 - Changing `effort` between requests invalidates cache breakpoints (matters
   when prompt caching is added later).
+
+## TODO for stage 4 (front-end + desktop.py)
+
+- **Raise the `/chat` timeout in `web/desktop.py` (`_ask_jarvis`) from 90 s to
+  about 180 s.** Since stage 3, `/chat` is serialized with a lock and a serious
+  (Opus) turn with tools can take longer, so a request queued behind another
+  one could otherwise time out and end the voice conversation silently.
+- Push the mode to the page with `evaluate_js` (like `setThinking`) and poll
+  `/status` from a small thread to catch the idle switch-off; both pages read
+  `/status` once on load (expand/shrink reload the page).
