@@ -15,6 +15,7 @@ page to actually speak text out loud - the browser's own speech
 """
 
 import json
+import re
 import sys
 import threading
 import time
@@ -32,6 +33,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import voice_capture
 import wake_word
 from server import app
+from jarvis_core import CONFIRM_STRONG, REPLY_LANGUAGE, detect_mode_command
 
 SERVER_URL = "http://127.0.0.1:5000"
 
@@ -43,6 +45,14 @@ TASKBAR_ALLOWANCE = 60  # leave room above the Windows taskbar
 CONVERSATION_WINDOW_SECONDS = 90  # how long to keep listening for a follow-up
 CHAT_TIMEOUT_SECONDS = 180  # was 90: /chat is serialized now, and a serious (Opus) turn with tools can take longer
 MODE_POLL_SECONDS = 30  # how often the watcher asks /mode, to catch the idle switch-off
+MAX_NOISE_IN_A_ROW = 3  # this many ignored "transcriptions" in a row end the conversation
+# What Whisper tends to invent out of silence or background noise. Whole utterance only.
+NOISE_PHRASES = {"you", "bye", "bye bye", "thank you", "thanks for watching", "thank you for watching",
+                 "thank you very much", "blank audio", "music", "applause", "silence",
+                 "obrigado", "obrigada", "tchau"}
+# Short answers she really says: a lone word from this list always goes through to Jarvis.
+SHORT_ANSWERS = {"yes", "yeah", "yep", "ok", "okay", "sure", "no", "nope", "stop", "cancel", "confirm",
+                 "save", "hello", "hi", "thanks"}
 
 _window = None  # set once create_window() runs, used by Api below
 _screen_size = None  # (width, height), computed once on the main thread
@@ -101,6 +111,19 @@ def _wait_for_server(timeout=10):
         except Exception:
             time.sleep(0.1)
     return False
+
+
+def _is_noise(text):
+    """True for what Whisper invents from silence/noise: a typical phrase, or a single word that is
+    neither a short answer (SHORT_ANSWERS), a confirmation (CONFIRM_STRONG) nor a mode command.
+    Empty text is handled by the caller ("heard nothing")."""
+    words = re.findall(r"[a-z0-9']+", (text or "").lower())
+    if not words:
+        return True
+    if " ".join(words) in NOISE_PHRASES:
+        return True
+    return (len(words) == 1 and words[0] not in SHORT_ANSWERS and words[0] not in CONFIRM_STRONG
+            and detect_mode_command(text) is None)
 
 
 def _time_greeting(lang):
@@ -190,9 +213,10 @@ def _ask_jarvis(text, detected_lang=None):
     since there's no visible transcript in the widget anyway.
     """
     message = text
-    if detected_lang and detected_lang.startswith("pt"):
+    lang = REPLY_LANGUAGE or detected_lang  # REPLY_LANGUAGE = "en": always English
+    if lang and lang.startswith("pt"):
         message = f"{text}\n\n[Reply in Portuguese.]"
-    elif detected_lang:
+    elif lang:
         message = f"{text}\n\n[Reply in English.]"
 
     try:
@@ -219,6 +243,7 @@ def _handle_wake():
         _speak_and_wait(_time_greeting(lang), lang)
 
         deadline = time.monotonic() + CONVERSATION_WINDOW_SECONDS
+        noise_in_a_row = 0
         while time.monotonic() < deadline:
             _set_thinking(True)
             text, detected_lang = voice_capture.transcribe()
@@ -230,6 +255,16 @@ def _handle_wake():
 
             print(f"[desktop] heard: {text!r} (lang={detected_lang})", flush=True)
 
+            if _is_noise(text):
+                noise_in_a_row += 1
+                print(f"[desktop] ignored noise: {text!r}", flush=True)
+                if noise_in_a_row >= MAX_NOISE_IN_A_ROW:
+                    print("[desktop] too much noise in a row - ending conversation", flush=True)
+                    break
+                continue  # keep listening; the conversation window is not reset
+            noise_in_a_row = 0
+
+            print(f"[desktop] sending: {text!r} (lang={detected_lang})", flush=True)
             _set_thinking(True)
             reply, mode = _ask_jarvis(text, detected_lang)
             _set_thinking(False)
@@ -242,7 +277,7 @@ def _handle_wake():
 
             print(f"[desktop] replied: {reply!r}", flush=True)
 
-            reply_lang = "pt-BR" if (detected_lang or "").startswith("pt") else "en-US"
+            reply_lang = "pt-BR" if (REPLY_LANGUAGE or detected_lang or "").startswith("pt") else "en-US"
             _speak_and_wait(reply, reply_lang)
             deadline = time.monotonic() + CONVERSATION_WINDOW_SECONDS  # reset after each real turn
     finally:

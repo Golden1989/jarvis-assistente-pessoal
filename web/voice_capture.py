@@ -5,8 +5,8 @@ The browser's own speech recognition (used by the dashboard's manual mic
 button, which works fine in a normal browser tab) needs a Google cloud
 service that isn't reachable from inside an embedded WebView2 window - so
 voice captured after the wake word is transcribed locally instead, with
-faster-whisper. Multilingual (auto-detects English/Portuguese per
-utterance), no account, nothing sent anywhere.
+faster-whisper. Multilingual, no account, nothing sent anywhere. The language is
+fixed by VOICE_LANGUAGE (see below) instead of being guessed per utterance.
 """
 
 import numpy as np
@@ -23,6 +23,13 @@ SILENCE_SECONDS = 1.2     # how much quiet after speech means "she's done"
 SILENCE_THRESHOLD = 25    # mean amplitude below this counts as silence (was 120) -
 # measured on the laptop mic without a headset: noise floor ~0.2, normal speech
 # averages ~68, so 25 sits between the two
+
+# Language Whisper is told to expect. Automatic detection (None) is unreliable on short
+# commands: an English "back to normal" said with an accent was taken for Portuguese. With
+# "en" everything she says is transcribed as English (Portuguese by voice then needs None).
+VOICE_LANGUAGE = "en"
+# Words she actually says - biases the decoder toward them.
+WHISPER_PROMPT = "Jarvis. Serious mode. Back to normal. Return to normal. Normal mode."
 
 _model = None
 
@@ -107,6 +114,11 @@ def transcribe():
 
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     model = _get_model()
-    segments, info = model.transcribe(audio, language=None)  # auto-detect language
+    segments, info = model.transcribe(
+        audio,
+        language=VOICE_LANGUAGE,       # None = auto-detect
+        initial_prompt=WHISPER_PROMPT,
+        vad_filter=True,               # Silero VAD drops non-speech before decoding: fewer hallucinations
+    )
     text = " ".join(segment.text for segment in segments).strip()
-    return text, info.language
+    return text, (VOICE_LANGUAGE or info.language)

@@ -26,6 +26,10 @@ MODES = {
     "serious": {"model": "claude-opus-5",   "input_price": 5.0, "output_price": 25.0,
                 "max_tokens": 4096, "effort": None},
 }   # prices: US$ per million tokens; effort None = the API's default (high)
+# Language of everything Jarvis says by itself (fixed mode replies, notices) and of the model's answers
+# (see the Language rule in BASE_SYSTEM_PROMPT). "en" = always English, even when she writes or
+# speaks Portuguese; None = mirror the message (the old behaviour of message_language()).
+REPLY_LANGUAGE = "en"
 DEFAULT_MODE = "normal"
 FALLBACK_MODE = "normal"        # where a refused request is retried, once
 SERIOUS_IDLE_MINUTES = 15       # serious mode switches itself off after this much silence
@@ -39,22 +43,29 @@ MODE_REPLIES = {
     ("normal", "pt"): "Modo normal.",
 }
 # Trigger phrases, already normalized (lowercase, no accents, no punctuation).
-# The language of the phrase that fired picks the reply language above.
+# The language of the phrase that fired only says WHICH trigger matched (Portuguese ones keep working);
+# the reply language is REPLY_LANGUAGE, or the phrase's own language when that is None.
 MODE_TRIGGERS = {
     ("serious", "en"): ("serious mode",),
     ("serious", "pt"): ("modo serio",),
-    ("normal", "en"): ("back to normal", "normal mode"),
+    ("normal", "en"): ("back to normal", "normal mode", "return to normal", "switch to normal", "go to normal",
+                       "standard mode", "regular mode", "default mode"),   # never the bare word "normal"
     ("normal", "pt"): ("modo normal",),
 }
 MODE_MAX_WORDS = 6         # a command must be a short message...
 MODE_MAX_EXTRA_WORDS = 3   # ...with at most this many words besides the trigger
 # Serious trigger + any of these = leave serious mode, never enter it.
 MODE_EXIT_WORDS = {"desativa", "desativar", "sai", "sair", "saia", "exit", "leave",
-                   "off", "stop", "cancel", "cancela", "pare", "disable"}
-# Any of these anywhere = a question or a negation, not a command.
-# ("no" is deliberately absent: in Portuguese it means "in the" - "entra no modo serio".)
-MODE_BLOCK_WORDS = {"nao", "dont", "never", "nunca", "nem", "que", "what", "como", "how",
-                    "why", "porque", "qual", "explica", "explain", "significa", "mean"}
+                   "off", "stop", "cancel", "cancela", "pare", "disable",
+                   "deactivate", "deactivated", "deactivating", "disengage", "quit", "end",
+                   "close", "terminate", "shutdown"}   # an exit word always beats activation
+# A question or a negation is not a command. The list used depends on the language of the
+# TRIGGER that matched: English "no"/"not" block an English command, but the Portuguese
+# "no" (= "in the": "entra no modo serio") is fine.
+MODE_BLOCK_WORDS = {
+    "en": {"no", "not", "without", "never", "dont", "what", "how", "why", "explain", "mean"},
+    "pt": {"nao", "nunca", "nem", "que", "como", "porque", "qual", "explica", "significa"},
+}
 
 # Notices she reads/hears. {amount}/{minutes}/{actions} are filled in by the caller.
 # The "fallback" text names serious mode because that is the mode that falls back.
@@ -128,9 +139,18 @@ ALLOWED_FOLDER = Path(r"C:\Projetos")
 BASE_SYSTEM_PROMPT = (
     "You are Jarvis, a personal assistant for conversation, debating ideas, "
     "and thinking things through. Language rule, check it on every single "
-    "reply: always answer in the same language as the user's LATEST message, "
-    "even if the profile/notes context below, earlier turns, or a tool result "
-    "is in a different language - the latest message always wins. If a "
+    "reply: ALWAYS answer in English, even when she writes to you in "
+    "Portuguese and even when the profile/notes context below, earlier turns, "
+    "or a tool result is in Portuguese. She understands and studies in "
+    "Portuguese: read and understand Portuguese perfectly, but reply in "
+    "English. Exception - answer in Portuguese ONLY when she explicitly asks "
+    "for it in that very message ('responde em português') or when the task "
+    "is to PRODUCE Portuguese text (translating into Portuguese, writing or "
+    "revising academic text in Portuguese): then the text itself comes out in "
+    "Portuguese and your own commentary around it stays in English. Never "
+    "switch to Portuguese just because her message is in Portuguese. Notes "
+    "saved with 'remember' are written in English, keeping proper names and "
+    "course/discipline terms as they are. If a "
     "personality section follows, that is how you should actually behave - "
     "not a description to summarize back, an identity to inhabit. If profile "
     "or people sections follow, use them: honor the profile's preferences on "
@@ -689,8 +709,6 @@ def detect_mode_command(text):
     words = _mode_words(text)
     if not words or len(words) > MODE_MAX_WORDS:
         return None
-    if any(w in MODE_BLOCK_WORDS for w in words):
-        return None
     hits = set()
     for key, phrases in MODE_TRIGGERS.items():
         for phrase in phrases:
@@ -702,13 +720,16 @@ def detect_mode_command(text):
     if len(hits) != 1:   # nothing, or ambiguous
         return None
     action, lang = next(iter(hits))
+    if any(w in MODE_BLOCK_WORDS[lang] for w in words):   # question/negation, in the trigger's language
+        return None
     if action == "serious" and any(w in MODE_EXIT_WORDS for w in words):
         action = "normal"
     return (action, lang)
 
 
 def mode_reply(command):
-    return MODE_REPLIES[command]
+    action, trigger_lang = command
+    return MODE_REPLIES[(action, REPLY_LANGUAGE or trigger_lang)]
 
 
 class ModeState:
@@ -999,8 +1020,11 @@ class CallInfo:
 
 
 def message_language(text):
-    """'pt' or 'en': the [Reply in ...] hint desktop.py adds when it knows the
-    spoken language, else a light heuristic."""
+    """Language of Jarvis's own notices: REPLY_LANGUAGE when it is set (always "en" today).
+    With REPLY_LANGUAGE = None it mirrors the message: the [Reply in ...] hint desktop.py adds
+    when it knows the spoken language, else a light heuristic."""
+    if REPLY_LANGUAGE:
+        return REPLY_LANGUAGE
     m = re.search(r"\[Reply in (Portuguese|English)\.?\]\s*$", text or "")
     if m:
         return "pt" if m.group(1) == "Portuguese" else "en"
