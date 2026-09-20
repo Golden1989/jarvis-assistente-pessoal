@@ -52,21 +52,54 @@ MODE_MAX_EXTRA_WORDS = 3   # ...with at most this many words besides the trigger
 MODE_EXIT_WORDS = {"desativa", "desativar", "sai", "sair", "saia", "exit", "leave",
                    "off", "stop", "cancel", "cancela", "pare", "disable"}
 # Any of these anywhere = a question or a negation, not a command.
-# (Portuguese "no" = "in the" is caught too: say "ativa o modo serio", not "entra no modo serio".)
-MODE_BLOCK_WORDS = {"nao", "no", "dont", "never", "nunca", "que", "what", "como", "how",
+# ("no" is deliberately absent: in Portuguese it means "in the" - "entra no modo serio".)
+MODE_BLOCK_WORDS = {"nao", "dont", "never", "nunca", "nem", "que", "what", "como", "how",
                     "why", "porque", "qual", "explica", "explain", "significa", "mean"}
 
-MODEL = "claude-sonnet-5"
-MAX_RESPONSE_TOKENS = 1024
+# Notices she reads/hears. {amount}/{minutes}/{actions} are filled in by the caller.
+# The "fallback" text names serious mode because that is the mode that falls back.
+NOTICES = {
+    "fallback": {"en": "Serious mode declined this request, so the normal model answered instead.",
+                 "pt": "O modo sério recusou esse pedido, então respondi com o modelo normal."},
+    "refused": {"en": "Neither model could answer this request, so I'm not retrying. Try rephrasing it.",
+                "pt": "Nenhum dos modelos pôde responder a esse pedido, então não vou tentar de novo. Tente reformular."},
+    "action_done": {"en": "Before the refusal, this message had already done: {actions}. "
+                          "Don't repeat the request, or it may be duplicated.",
+                    "pt": "Antes da recusa, esta mensagem já tinha feito: {actions}. "
+                          "Não repita o pedido, para não duplicar."},
+    "truncated": {"en": "(My answer was cut off at the length limit.)",
+                  "pt": "(Minha resposta foi cortada no limite de tamanho.)"},
+    "empty": {"en": "I couldn't put an answer together for that. Please try again.",
+              "pt": "Não consegui montar uma resposta para isso. Pode tentar de novo?"},
+    "cost_alert": {"en": "Heads up: this session's cost passed ${amount:.2f}.",
+                   "pt": "Aviso: o custo da sessão passou de US$ {amount:.2f}."},
+    "idle_revert": {"en": "Serious mode switched itself off after {minutes} minutes without use.",
+                    "pt": "O modo sério se desligou sozinho após {minutes} minutos sem uso."},
+}
+# Tools whose success changes something outside the conversation. If one of
+# them succeeded before a double refusal, the reply says so (she must not
+# repeat the request). ACTION_SUCCESS: what a SUCCESSFUL result contains.
+ACTION_LABELS = {
+    "create_calendar_event": {"en": "a calendar event was created", "pt": "um evento foi criado no calendário"},
+    "remember": {"en": "a note was saved", "pt": "uma nota foi salva"},
+    "update_notes": {"en": "the notes were rewritten", "pt": "as notas foram reescritas"},
+    "confirm_pending_note": {"en": "a held note was saved", "pt": "uma nota retida foi salva"},
+}
+ACTION_SUCCESS = {
+    "create_calendar_event": ("Event created",),
+    "remember": ("Saved under",),
+    "update_notes": ("Notes updated",),
+    "confirm_pending_note": ("Saved under", "Notes updated"),
+}
 
 # Long-edge cap for screenshots sent to Claude. Oversized images inside a
 # tool_result are REJECTED by the API rather than auto-resized, so we shrink
 # them ourselves before sending. 1568px keeps us within the standard tier.
 MAX_SCREENSHOT_EDGE = 1568
 
-# claude-sonnet-5 pricing (US$ per million tokens).
-INPUT_PRICE = 2.0
-OUTPUT_PRICE = 10.0
+# Legacy aliases (normal-mode prices, US$ per million tokens); dropped in stage 3.
+INPUT_PRICE = MODES[DEFAULT_MODE]["input_price"]
+OUTPUT_PRICE = MODES[DEFAULT_MODE]["output_price"]
 
 # Anchored to this file's own folder (the project root), NOT the current
 # working directory - desktop.py runs with its CWD inside web/, which made
@@ -950,11 +983,103 @@ class SystemPromptProvider:
         return self.fixed + self.notes
 
 
-def extract_text(response):
-    """The response is a list of blocks; join the text ones for display."""
-    return "\n".join(
-        block.text for block in response.content if block.type == "text"
-    )
+class ModelRefusedError(Exception):
+    """The requested model AND the fallback both refused: nothing was answered."""
+
+    def __init__(self, category=None):
+        super().__init__(f"refused (category: {category})")
+        self.category = category
+
+
+class CallInfo:
+    """What happened inside one call_claude(), filled in place (also when it raises)."""
+
+    def __init__(self):
+        self.usage = []         # one row per API response, refusals included
+        self.refusals = []      # [(model, category)], in order
+        self.fallback = False   # a refusal moved this turn to FALLBACK_MODE
+        self.truncated = False  # the final answer hit max_tokens
+        self.actions = []       # side-effect tools that SUCCEEDED this turn (see ACTION_SUCCESS)
+
+
+def message_language(text):
+    """'pt' or 'en': the [Reply in ...] hint desktop.py adds when it knows the
+    spoken language, else a light heuristic."""
+    m = re.search(r"\[Reply in (Portuguese|English)\.?\]\s*$", text or "")
+    if m:
+        return "pt" if m.group(1) == "Portuguese" else "en"
+    t = text or ""
+    if re.search(r"[ãõçáéíóúâêô]", t, re.I) or re.search(
+            r"\b(você|voce|não|nao|está|para|isso|então|entao|pode|quero|olá|ola)\b", t, re.I):
+        return "pt"
+    return "en"
+
+
+def _cut_to_last_sentence(text):
+    """Text up to its last complete sentence/line ('' if none) - never half a sentence."""
+    ends = list(re.finditer(r"[.!?…](?=\s|$)|\n", text))
+    return text[:ends[-1].end()].strip() if ends else ""
+
+
+def _action_happened(name, result):
+    """True if this tool call really changed something (not blocked, not failed)."""
+    markers = ACTION_SUCCESS.get(name)
+    return bool(markers) and isinstance(result, str) and any(m in result for m in markers)
+
+
+def _answer_text(response):
+    return "\n".join(b.text for b in response.content if b.type == "text" and b.text).strip()
+
+
+def extract_text(response, lang="en"):
+    """Join the text blocks; never empty - a response with no text becomes a fixed phrase."""
+    return _answer_text(response) or NOTICES["empty"][lang]
+
+
+def compose_reply(response, info=None, lang="en", state=None):
+    """
+    The final text she reads AND hears, and the ONLY place the pending-memory
+    notice is added (server.py and jarvis.py must not add it themselves).
+    In order: fallback notice; the answer (never empty; if it hit max_tokens it
+    is cut back to its last full sentence and flagged); the pending-memory
+    notice; the cost alert (once per step).
+    """
+    parts = []
+    if info is not None and info.fallback:
+        parts.append(NOTICES["fallback"][lang])
+    text = _answer_text(response)
+    if info is not None and info.truncated:
+        text = _cut_to_last_sentence(text)
+        parts.append(f"{text}\n{NOTICES['truncated'][lang]}" if text else NOTICES["truncated"][lang])
+    else:
+        parts.append(text or NOTICES["empty"][lang])
+    note = memory_notice()
+    if note:
+        parts.append(note)
+    if state is not None:
+        step = state.take_cost_alert()
+        if step is not None:
+            parts.append(NOTICES["cost_alert"][lang].format(amount=step))
+    return "\n\n".join(parts)
+
+
+def refusal_reply(lang="en", state=None, info=None):
+    """
+    Reply for a double refusal (the server sends it as HTTP 200 so the voice
+    speaks it). If an action (calendar event, saved note) had already succeeded
+    earlier in that turn, it says so - she must not repeat the request and
+    duplicate it. No memory notice: that round was rolled back.
+    """
+    parts = [NOTICES["refused"][lang]]
+    done = list(dict.fromkeys(info.actions)) if info is not None else []
+    if done:
+        actions = "; ".join(ACTION_LABELS[name][lang] for name in done)
+        parts.append(NOTICES["action_done"][lang].format(actions=actions))
+    if state is not None:
+        step = state.take_cost_alert()
+        if step is not None:
+            parts.append(NOTICES["cost_alert"][lang].format(amount=step))
+    return "\n\n".join(parts)
 
 
 def _block_get(block, key):
@@ -1023,36 +1148,100 @@ def trim_history(messages, max_exchanges=MAX_HISTORY_EXCHANGES):
     return trimmed
 
 
-def call_claude(client, system_prompt, messages):
-    """Wraps the tool loop with the guard's per-message bookkeeping."""
+def _is_clean_text_answer(content):
+    """True if content has text and no client tool_use and no web_search call
+    missing its result - i.e. it is safe to store as-is."""
+    blocks = [{"type": _block_get(b, "type"), "id": _block_get(b, "id"),
+               "tool_use_id": _block_get(b, "tool_use_id"), "text": _block_get(b, "text")} for b in content]
+    if any(b["type"] == "tool_use" for b in blocks):
+        return False
+    searched = {b["id"] for b in blocks if b["type"] == "server_tool_use"}
+    answered = {b["tool_use_id"] for b in blocks if b["type"] == "web_search_tool_result"}
+    return searched == answered and any(b["type"] == "text" and (b["text"] or "").strip() for b in blocks)
+
+
+def call_claude(client, system_prompt, messages, mode=DEFAULT_MODE, state=None, info=None):
+    """
+    Wraps the tool loop with the guard's per-message bookkeeping: begin_round
+    ONCE per message - a refusal retry is not another round.
+    mode: key of MODES. state: optional ModeState; every response's usage is
+    added to it, refusals included. info: optional CallInfo, filled in place.
+    """
+    info = info if info is not None else CallInfo()
     _guard.begin_round(_latest_user_text(messages))
     try:
-        return _call_claude_loop(client, system_prompt, messages)
+        return _call_claude_loop(client, system_prompt, messages, mode, state, info)
     except BaseException:
         _guard.abort_round()
         raise
 
 
-def _call_claude_loop(client, system_prompt, messages):
+def _call_claude_loop(client, system_prompt, messages, mode, state, info):
     """
     Call the API and resolve any custom tool calls until Claude is done.
     Mutates `messages` in place (appending every assistant/tool round) and
     returns (final_response, total_input_tokens, total_output_tokens).
+
+    Thinking blocks in `messages` are sent back untouched, also when the mode
+    changes between messages: the docs say the API ignores or drops what the
+    target model can't read, so nothing is stripped on the client.
     """
     total_input = 0
     total_output = 0
+    active = mode
 
     while True:
+        settings = MODES[active]
+        extra = {}
+        if settings["effort"] is not None:   # only sent when set; `thinking` is never sent
+            extra["extra_body"] = {"output_config": {"effort": settings["effort"]}}
         response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_RESPONSE_TOKENS,
+            model=settings["model"],
+            max_tokens=settings["max_tokens"],
             system=system_prompt,
             tools=TOOLS,
             messages=trim_history(messages),
+            **extra,
         )
-        total_input += response.usage.input_tokens
-        total_output += response.usage.output_tokens
-        _guard.observe(response.content)   # before any tool of this response runs
+        # Count what the response reports - refusals included, nothing assumed zero.
+        usage = getattr(response, "usage", None)
+        n_in = getattr(usage, "input_tokens", None) or 0
+        n_out = getattr(usage, "output_tokens", None) or 0
+        thinking = getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", None)
+        total_input += n_in
+        total_output += n_out
+        info.usage.append({"model": settings["model"], "input_tokens": n_in,
+                           "output_tokens": n_out, "thinking_tokens": thinking})
+        if state is not None:
+            state.add_usage(settings["model"], n_in, n_out)
+        print(f"[usage] {settings['model']} in={n_in} out={n_out} thinking={thinking}", flush=True)
+        # EVERY response (refusals and the fallback's too), before any of its tools run.
+        _guard.observe(response.content)
+
+        stop = getattr(response, "stop_reason", None)
+
+        if stop == "refusal":
+            category = _block_get(getattr(response, "stop_details", None), "category")
+            info.refusals.append((settings["model"], category))
+            print(f"[refusal] model={settings['model']} category={category or 'none'}", flush=True)
+            if active != FALLBACK_MODE and not info.fallback:
+                info.fallback = True
+                active = FALLBACK_MODE   # stays there for the rest of this turn
+                print(f"[refusal] retrying once on {MODES[active]['model']}, continuing from the "
+                      "current messages (tool results already sent are NOT redone)", flush=True)
+                continue   # the refused response is NOT appended; `messages` is untouched
+            raise ModelRefusedError(category)
+
+        if stop == "max_tokens":
+            info.truncated = True
+            print(f"[truncated] {settings['model']} hit max_tokens={settings['max_tokens']}", flush=True)
+            if not _is_clean_text_answer(response.content):
+                # An incomplete tool call/search must never run or be stored: an
+                # unanswered tool_use would make every later request a 400. Keep
+                # the history valid with a plain marker instead.
+                messages.append({"role": "assistant",
+                                 "content": [{"type": "text", "text": "[answer cut off at the length limit]"}]})
+                return response, total_input, total_output
 
         # Keep the raw content blocks (not just the text) in the history.
         # This preserves tool_use/tool_result pairs and web search citations
@@ -1069,6 +1258,8 @@ def _call_claude_loop(client, system_prompt, messages):
         for block in response.content:
             if block.type == "tool_use":
                 result = run_tool(block.name, block.input)
+                if _action_happened(block.name, result):
+                    info.actions.append(block.name)   # a refusal reply must warn about it
                 # Most tools return plain text. look_at_screen returns an
                 # image dict instead (see _capture_screen) - wrap it as an
                 # image content block rather than stringifying it.
