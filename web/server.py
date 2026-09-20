@@ -91,6 +91,14 @@ def status():
     )
 
 
+@app.route("/mode")
+def mode_endpoint():
+    """Tiny read for the desktop watcher and the widget: no chat_lock, no touch()
+    (so polling can never keep serious mode alive), no Google Calendar."""
+    snap = mode_state.snapshot()
+    return jsonify({k: snap[k] for k in ("mode", "model", "serious_seconds_left")})
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     user_input = (request.json or {}).get("message", "").strip()

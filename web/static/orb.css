@@ -1,0 +1,106 @@
+/*
+ * HUD orb - SVG + CSS. No canvas, no raster images, no JS loop.
+ *
+ * Budget rules this file follows:
+ *  - Idle = every animation PAUSED (the JS only plays them while active).
+ *  - Active animates ONLY transform (rotations, core pulse) and opacity (the
+ *    "thinking" accent). No filter, blur, animated box-shadow or backdrop-filter.
+ *  - Glow = static layers: a wide, faint stroke UNDER a thin bright one, and radial gradients.
+ *  - Each spinning ring is its own compositor layer (will-change: transform) whose
+ *    content is rasterised ONCE; the GPU only rotates it.
+ *
+ * Palettes are CSS variables. body.serious (or .orb.is-serious, for the prototype
+ * gallery) swaps them.
+ */
+.orb {
+  --c1: #447BBE;            /* normal: classic blue ... */
+  --c2: #2B3784;            /* ... to deep blue */
+  --accent: #B11313;        /* "thinking" accent: metallic red */
+  --hi: #D6E6FF;            /* core highlight */
+  --c1-rgb: 68, 123, 190;
+  --hi-rgb: 214, 230, 255;
+  --accent-rgb: 177, 19, 19;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  contain: layout paint style;
+}
+
+body.serious .orb,
+.orb.is-serious {
+  --c1: #FFB000;            /* serious: gold ... */
+  --c2: #FF7A00;            /* ... to burnt orange */
+  --accent: #B0173F;        /* "thinking" accent: vivid wine */
+  --hi: #FFF0C2;
+  --c1-rgb: 255, 176, 0;
+  --hi-rgb: 255, 240, 194;
+  --accent-rgb: 176, 23, 63;
+}
+
+.orb .layer { position: absolute; inset: 0; width: 100%; height: 100%; }
+.orb .spin { will-change: transform; }
+.orb svg { overflow: visible; }
+
+/* colour helpers for SVG strokes/fills (presentation attributes cannot use var()) */
+.orb .s-c1 { stroke: var(--c1); }
+.orb .s-c2 { stroke: var(--c2); }
+.orb .s-hi { stroke: var(--hi); }
+.orb .s-acc { stroke: var(--accent); }
+.orb .f-hi { fill: var(--hi); }
+.orb .f-c1 { fill: var(--c1); }
+
+/* ---- thick segmented ring: a real angular gradient (conic) masked to a ring of radial marks ---- */
+.orb .l1 {
+  background: conic-gradient(from -30deg,
+    color-mix(in srgb, var(--c1) 62%, #fff) 0deg, var(--c1) 34deg, var(--c2) 250deg, transparent 272deg);
+  -webkit-mask-image:
+    radial-gradient(closest-side, transparent 73%, #000 73.6%, #000 83.4%, transparent 84%),
+    repeating-conic-gradient(#000 0deg 2.3deg, transparent 2.3deg 3.6deg);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    radial-gradient(closest-side, transparent 73%, #000 73.6%, #000 83.4%, transparent 84%),
+    repeating-conic-gradient(#000 0deg 2.3deg, transparent 2.3deg 3.6deg);
+  mask-composite: intersect;
+}
+/* wide faint ring under the thick one = the glow (static, no blur) */
+.orb .l1g {
+  background: conic-gradient(from -30deg, var(--c1) 0deg, var(--c2) 250deg, transparent 272deg);
+  -webkit-mask-image: radial-gradient(closest-side, transparent 66%, #000 76%, #000 81%, transparent 91%);
+  mask-image: radial-gradient(closest-side, transparent 66%, #000 76%, #000 81%, transparent 91%);
+  opacity: .20;
+}
+
+/* ---- core ---- */
+.orb .pulse,
+.orb .pulse-accent {
+  position: absolute;
+  inset: 31%;
+  border-radius: 50%;
+  will-change: transform, opacity;
+}
+.orb .pulse {
+  background: radial-gradient(circle closest-side,
+    rgba(var(--hi-rgb), .95) 0%, rgba(var(--hi-rgb), .55) 14%, rgba(var(--c1-rgb), .38) 46%, rgba(var(--c1-rgb), 0) 100%);
+}
+.orb .pulse-accent {
+  inset: 38%;               /* smaller than the core glow: a red heart, not a tinted core */
+  background: radial-gradient(circle closest-side,
+    rgba(var(--accent-rgb), .75) 0%, rgba(var(--accent-rgb), .30) 55%, rgba(var(--accent-rgb), 0) 100%);
+  opacity: 0;
+  transition: opacity .35s;
+}
+
+/* ---- "thinking" accent: opacity only ---- */
+.orb .accent { opacity: 0; transition: opacity .35s; }
+.orb.thinking .accent { opacity: 1; }
+.orb.thinking .pulse-accent { opacity: .8; }
+
+/* widget: 3 rings + core */
+.orb-simple .l2,
+.orb-simple .detail { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .orb * { transition: none !important; }
+}

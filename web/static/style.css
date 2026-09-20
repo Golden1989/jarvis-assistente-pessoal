@@ -1,11 +1,15 @@
 :root {
   --blue: #1e78ff;
   --blue-glow: #4fc3f7;
+  --glow-rgb: 79, 195, 247;   /* the cyan as r,g,b - every glow follows it */
   --red: #ff3b4e;
+  --red-rgb: 255, 59, 78;    /* the red as r,g,b */
+  --accent-text: #ff3b4e;    /* red used AS TEXT (kept separate: wine has poor contrast on dark) */
+  --bar-bg: rgba(4, 6, 11, 0.9);
   --red-dim: #b3121f;
   --bg: #04060b;
   --panel-bg: rgba(6, 12, 22, 0.6);
-  --border: rgba(79, 195, 247, 0.3);
+  --border: rgba(var(--glow-rgb), 0.3);
   --text: #cfeeff;
   --text-dim: rgba(207, 238, 255, 0.45);
 }
@@ -40,15 +44,8 @@ body {
     transparent 1px,
     transparent 3px
   );
-  mix-blend-mode: overlay;
-  animation: flicker 6s infinite;
-}
-
-@keyframes flicker {
-  0%, 95%, 100% { opacity: 1; }
-  96% { opacity: 0.82; }
-  97% { opacity: 1; }
-  98% { opacity: 0.88; }
+  /* Static on purpose: mix-blend-mode plus an endless flicker animation kept a full-screen layer
+     re-composited on every frame (measured: about 4x the CPU of the whole dashboard at rest). */
 }
 
 /* ---------- top bar ---------- */
@@ -74,14 +71,14 @@ body {
   border-radius: 6px;
   color: var(--blue-glow);
   font-size: 16px;
-  box-shadow: 0 0 10px rgba(79, 195, 247, 0.5);
+  box-shadow: 0 0 10px rgba(var(--glow-rgb), 0.5);
 }
 
 .brand-title {
   font-weight: 700;
   letter-spacing: 4px;
   font-size: 18px;
-  text-shadow: 0 0 8px rgba(79, 195, 247, 0.7);
+  text-shadow: 0 0 8px rgba(var(--glow-rgb), 0.7);
 }
 
 .brand-tagline {
@@ -114,19 +111,18 @@ body {
   border-radius: 50%;
   background: var(--blue-glow);
   box-shadow: 0 0 8px var(--blue-glow);
-  animation: blink 2.4s ease-in-out infinite;
 }
 
 .dot.thinking {
   background: var(--red);
   box-shadow: 0 0 8px var(--red);
-  animation-duration: 0.6s;
+  animation: blink 0.6s ease-in-out infinite; /* blinks only while thinking/speaking */
 }
 
 .clock {
   font-size: 16px;
   letter-spacing: 2px;
-  text-shadow: 0 0 6px rgba(79, 195, 247, 0.6);
+  text-shadow: 0 0 6px rgba(var(--glow-rgb), 0.6);
 }
 
 .topbar-right { display: flex; align-items: center; gap: 16px; }
@@ -233,7 +229,7 @@ body {
 
 .metric-label { color: var(--text-dim); }
 .metric-value { font-weight: 600; }
-.metric-value.accent { color: var(--red); text-shadow: 0 0 6px rgba(255, 59, 78, 0.6); }
+.metric-value.accent { color: var(--accent-text); text-shadow: 0 0 6px rgba(var(--red-rgb), 0.6); }
 
 .bars {
   display: flex;
@@ -247,7 +243,7 @@ body {
   flex: 1;
   background: linear-gradient(to top, var(--blue), var(--blue-glow));
   min-height: 3px;
-  box-shadow: 0 0 4px rgba(79, 195, 247, 0.6);
+  box-shadow: 0 0 4px rgba(var(--glow-rgb), 0.6);
 }
 
 .tool-list { list-style: none; margin: 0; padding: 0; font-size: 12px; }
@@ -257,7 +253,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 6px 0;
-  border-bottom: 1px dashed rgba(79, 195, 247, 0.15);
+  border-bottom: 1px dashed rgba(var(--glow-rgb), 0.15);
   color: var(--text-dim);
 }
 
@@ -267,7 +263,7 @@ body {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: rgba(79, 195, 247, 0.4);
+  background: rgba(var(--glow-rgb), 0.4);
   flex-shrink: 0;
 }
 
@@ -296,7 +292,7 @@ body {
 .log-line { margin-bottom: 6px; }
 .log-line .ts { color: var(--text-dim); margin-right: 6px; }
 .log-line .who { font-weight: 700; margin-right: 4px; }
-.log-line.user .who { color: var(--red); }
+.log-line.user .who { color: var(--accent-text); }
 .log-line.jarvis .who { color: var(--blue-glow); }
 .log-line.system { color: var(--text-dim); font-style: italic; }
 
@@ -321,16 +317,13 @@ body {
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  border: 1px solid rgba(79, 195, 247, 0.3);
-  animation: spin 60s linear infinite;
+  border: 1px solid rgba(var(--glow-rgb), 0.3);
   pointer-events: none;
 }
 
-.radar.thinking .ring-outer { animation-duration: 10s; }
-
 .crosshair {
   position: absolute;
-  background: rgba(79, 195, 247, 0.15);
+  background: rgba(var(--glow-rgb), 0.15);
   pointer-events: none;
 }
 
@@ -346,7 +339,7 @@ body {
   font-weight: 700;
   letter-spacing: 2px;
   color: var(--blue-glow);
-  text-shadow: 0 0 8px rgba(79, 195, 247, 0.7);
+  text-shadow: 0 0 8px rgba(var(--glow-rgb), 0.7);
   white-space: nowrap;
 }
 
@@ -358,13 +351,13 @@ body {
   gap: 12px;
   padding: 14px 32px;
   border-top: 1px solid var(--border);
-  background: rgba(4, 6, 11, 0.9);
+  background: var(--bar-bg);
 }
 
 .command-bar .prompt {
   color: var(--blue-glow);
   font-weight: 700;
-  text-shadow: 0 0 6px rgba(79, 195, 247, 0.6);
+  text-shadow: 0 0 6px rgba(var(--glow-rgb), 0.6);
 }
 
 .command-bar input {
@@ -408,8 +401,8 @@ body {
 .command-bar .icon-btn.active,
 .command-bar #mic-btn.listening {
   border-color: var(--red);
-  color: var(--red);
-  box-shadow: 0 0 8px rgba(255, 59, 78, 0.5);
+  color: var(--accent-text);
+  box-shadow: 0 0 8px rgba(var(--red-rgb), 0.5);
 }
 
 .command-bar #mic-btn.listening { animation: pulse-ping 1.1s ease-out infinite; }
@@ -420,17 +413,36 @@ body {
 
 /* ---------- keyframes ---------- */
 
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
 
 @keyframes pulse-ping {
-  0% { box-shadow: 0 0 0 0 rgba(255, 59, 78, 0.7); }
-  100% { box-shadow: 0 0 0 10px rgba(255, 59, 78, 0); }
+  0% { box-shadow: 0 0 0 0 rgba(var(--red-rgb), 0.7); }
+  100% { box-shadow: 0 0 0 10px rgba(var(--red-rgb), 0); }
 }
+
+/* ---------- serious mode ----------
+   Idle = amber (replaces the cyan/blue), "thinking" = wine (replaces the red).
+   Text never uses wine (contrast) - it stays light/amber. The orb has its own palette
+   (--c1/--c2/--accent in orb.css, also swapped by body.serious). */
+body.serious {
+  --blue: #ff9d00;
+  --blue-glow: #ffc247;
+  --glow-rgb: 255, 176, 0;
+  --red: #b22246;
+  --red-rgb: 178, 34, 70;
+  --red-dim: #6d1530;
+  --accent-text: #ffd27a;
+  --border: rgba(var(--glow-rgb), 0.3);   /* re-declared: var() resolves where it is declared */
+  --text: #ffe8c8;
+  --text-dim: rgba(255, 232, 200, 0.45);
+  --panel-bg: rgba(20, 9, 10, 0.6);
+  --bar-bg: rgba(10, 4, 6, 0.9);
+  background: radial-gradient(ellipse at 50% 35%, #2a0d17 0%, #060304 70%);
+}
+
+.mode-line { margin-top: 4px; font-size: 10px; letter-spacing: 2px; color: var(--blue-glow); white-space: nowrap; }
+.cost-models { margin: 2px 0 6px; font-size: 11px; color: var(--text-dim); }
+.cost-model { display: flex; justify-content: space-between; }

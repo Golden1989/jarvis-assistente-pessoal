@@ -41,6 +41,8 @@ DASHBOARD_HEIGHT = 760
 MARGIN = 24
 TASKBAR_ALLOWANCE = 60  # leave room above the Windows taskbar
 CONVERSATION_WINDOW_SECONDS = 90  # how long to keep listening for a follow-up
+CHAT_TIMEOUT_SECONDS = 180  # was 90: /chat is serialized now, and a serious (Opus) turn with tools can take longer
+MODE_POLL_SECONDS = 30  # how often the watcher asks /mode, to catch the idle switch-off
 
 _window = None  # set once create_window() runs, used by Api below
 _screen_size = None  # (width, height), computed once on the main thread
@@ -94,7 +96,7 @@ def _wait_for_server(timeout=10):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            urllib.request.urlopen(f"{SERVER_URL}/status", timeout=0.5)
+            urllib.request.urlopen(f"{SERVER_URL}/mode", timeout=0.5)  # not /status: that one calls Google
             return True
         except Exception:
             time.sleep(0.1)
@@ -142,10 +144,43 @@ def _set_thinking(on):
         pass  # purely cosmetic - not worth interrupting the conversation over
 
 
+def _set_mode(mode):
+    """Tells the page which mode is on (amber orb/ring in serious mode)."""
+    if _window is None or mode not in ("normal", "serious"):
+        return
+    try:
+        _window.evaluate_js(f"window.setMode && window.setMode({json.dumps(mode)})")
+    except Exception:
+        pass  # purely cosmetic - not worth interrupting the conversation over
+
+
+def _sync_mode(last_mode):
+    """One /mode poll (no chat lock, no touch, no Calendar): pushes the mode to
+    the page only when it changed. Returns the mode to remember."""
+    try:
+        with urllib.request.urlopen(f"{SERVER_URL}/mode", timeout=5) as response:
+            mode = json.loads(response.read()).get("mode")
+    except Exception:
+        return last_mode
+    if mode and mode != last_mode:
+        _set_mode(mode)
+    return mode or last_mode
+
+
+def _watch_mode():
+    """Background thread: catches serious mode switching itself off when idle."""
+    last = None
+    time.sleep(2)  # let the window load first
+    while True:
+        last = _sync_mode(last)
+        time.sleep(MODE_POLL_SECONDS)
+
+
 def _ask_jarvis(text, detected_lang=None):
     """
     Reuses the same /chat endpoint the browser itself calls, so behavior
     (tools, memory, everything) matches exactly - no logic duplicated here.
+    Returns (reply, mode); (None, None) on any failure.
 
     A voice conversation is long-running, and the model sometimes "sticks"
     to whatever language it last replied in instead of matching each new
@@ -167,12 +202,12 @@ def _ask_jarvis(text, detected_lang=None):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
             data = json.loads(response.read())
-        return data.get("reply")
+        return data.get("reply"), data.get("mode")
     except Exception as error:
         print(f"[desktop] _ask_jarvis failed: {error}", flush=True)
-        return None
+        return None, None
 
 
 def _handle_wake():
@@ -196,8 +231,10 @@ def _handle_wake():
             print(f"[desktop] heard: {text!r} (lang={detected_lang})", flush=True)
 
             _set_thinking(True)
-            reply = _ask_jarvis(text, detected_lang)
+            reply, mode = _ask_jarvis(text, detected_lang)
             _set_thinking(False)
+            if mode:
+                _set_mode(mode)  # e.g. "Serious mode activating." changes the orb right away
 
             if not reply:
                 print("[desktop] _ask_jarvis returned nothing - ending conversation", flush=True)
@@ -245,6 +282,7 @@ def main():
     )
 
     threading.Thread(target=wake_word.listen_forever, args=(_on_wake_word,), daemon=True).start()
+    threading.Thread(target=_watch_mode, daemon=True).start()
 
     # private_mode=False: without this, pywebview wipes cookies and
     # localStorage (language/mute preferences) every time the app restarts.

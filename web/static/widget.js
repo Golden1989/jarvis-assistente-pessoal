@@ -50,5 +50,20 @@ window.speakText = function (text, lang, onDone) {
 };
 
 window.setThinking = function (on) {
+  stage.classList.toggle("thinking", on); // kept for compatibility: no CSS uses it now (the orb handles "thinking" itself)
   if (window.Orb) Orb.setThinking(on);
 };
+
+// Called from desktop.py (evaluate_js) and once on load.
+window.setMode = function (mode) {
+  stage.classList.toggle("serious", mode === "serious");
+  document.documentElement.classList.toggle("serious", mode === "serious"); // page background too
+  if (window.Orb) Orb.setMode(mode === "serious" ? "serious" : "normal");
+};
+
+// expand/shrink reload this page, so ask the server for the current mode once.
+// /mode is tiny: no chat lock, no touch(), no Google Calendar.
+fetch("/mode")
+  .then((response) => response.json())
+  .then((data) => window.setMode(data.mode))
+  .catch(() => {});

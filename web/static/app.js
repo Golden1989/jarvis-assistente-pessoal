@@ -17,12 +17,43 @@ const barsEl = document.getElementById("bars");
 const toolListEl = document.getElementById("tool-list");
 const toolCountEl = document.getElementById("tool-count");
 const calendarBody = document.getElementById("calendar-body");
+const brandTagline = document.getElementById("brand-tagline");
+const modeLine = document.getElementById("mode-line");
+const costModelsEl = document.getElementById("cost-models");
+const DEFAULT_TAGLINE = brandTagline.textContent;
 
 let toolNames = [];
 let barHistory = [];
 
+// Mode state (the server owns the truth; this mirrors it). Declared above tick(),
+// which runs immediately.
+let currentMode = "normal";
+let currentModel = "";
+let seriousDeadline = null; // Date.now() at which serious mode switches itself off
+let statusInFlight = false; // one /status request at a time...
+let statusAgain = false;    // ...plus at most one more queued behind it
+
+const shortModel = (id) => String(id || "").replace("claude-", "");
+const idleStatusText = () => (currentMode === "serious" ? "SERIOUS" : "OPTIMAL");
+const idleCoreLabel = () => (currentMode === "serious" ? "CORE SERIOUS" : "CORE ACTIVE");
+
+function renderModeLine() {
+  let text = `MODE: ${currentMode.toUpperCase()}`;
+  if (currentModel) text += ` · ${shortModel(currentModel).toUpperCase()}`;
+  if (seriousDeadline !== null) {
+    const s = Math.max(0, Math.round((seriousDeadline - Date.now()) / 1000));
+    text += ` · IDLE OFF IN ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }
+  modeLine.textContent = text; // textContent: nothing from the server is ever parsed as HTML
+}
+
 function tick() {
   clockEl.textContent = new Date().toLocaleTimeString("en-GB", { hour12: false });
+  renderModeLine();
+  if (seriousDeadline !== null && Date.now() > seriousDeadline + 1500) {
+    seriousDeadline = null; // clear FIRST: one attempt per deadline, never a request every second
+    refreshStatus({ quiet: true });
+  }
 }
 tick();
 setInterval(tick, 1000);
@@ -30,9 +61,42 @@ setInterval(tick, 1000);
 function setThinking(on) {
   radar.classList.toggle("thinking", on);
   statusDot.classList.toggle("thinking", on);
-  statusText.textContent = on ? "PROCESSING" : "OPTIMAL";
-  coreLabel.textContent = on ? "CORE THINKING" : "CORE ACTIVE";
+  statusText.textContent = on ? "PROCESSING" : idleStatusText();
+  coreLabel.textContent = on ? "CORE THINKING" : idleCoreLabel();
   if (window.Orb) Orb.setThinking(on);
+}
+
+// Called by desktop.py through evaluate_js (voice), by refreshStatus() and by the chat reply.
+function setMode(mode, model, secondsLeft) {
+  const next = mode === "serious" ? "serious" : "normal"; // anything else from the server counts as normal
+  const changed = next !== currentMode;
+  currentMode = next;
+  if (model) currentModel = String(model);
+  seriousDeadline = next === "serious" && typeof secondsLeft === "number" ? Date.now() + secondsLeft * 1000 : null;
+  document.body.classList.toggle("serious", next === "serious");
+  brandTagline.textContent = next === "serious" ? `SERIOUS MODE // ${shortModel(currentModel).toUpperCase()}` : DEFAULT_TAGLINE;
+  if (["OPTIMAL", "SERIOUS"].includes(statusText.textContent)) { // don't clobber PROCESSING / SPEAKING
+    statusText.textContent = idleStatusText();
+    coreLabel.textContent = idleCoreLabel();
+  }
+  if (window.Orb) Orb.setMode(next);
+  renderModeLine();
+  if (changed) addLog("system", `mode: ${next} (${currentModel})`);
+}
+window.setMode = setMode;
+
+function renderCostModels(byModel) {
+  costModelsEl.textContent = "";
+  Object.entries(byModel || {}).forEach(([model, row]) => {
+    const line = document.createElement("div");
+    line.className = "cost-model";
+    const name = document.createElement("span");
+    name.textContent = shortModel(model);
+    const cost = document.createElement("span");
+    cost.textContent = `$${Number(row.cost).toFixed(4)}`;
+    line.append(name, cost);
+    costModelsEl.appendChild(line);
+  });
 }
 
 function escapeHtml(str) {
@@ -187,7 +251,7 @@ function looksPortuguese(text) {
 }
 
 function setSpeaking(on) {
-  statusText.textContent = on ? "SPEAKING" : "OPTIMAL";
+  statusText.textContent = on ? "SPEAKING" : idleStatusText();
   statusDot.classList.toggle("thinking", on);
 }
 
@@ -212,7 +276,12 @@ function speak(text) {
   window.speechSynthesis.speak(utterance);
 }
 
-async function refreshStatus() {
+async function refreshStatus({ quiet = false } = {}) {
+  if (statusInFlight) {
+    statusAgain = true; // coalesce: exactly one more run when the current request finishes
+    return;
+  }
+  statusInFlight = true;
   try {
     const res = await fetch("/status");
     const data = await res.json();
@@ -221,9 +290,17 @@ async function refreshStatus() {
     tokInEl.textContent = data.session.input_tokens;
     tokOutEl.textContent = data.session.output_tokens;
     costEl.textContent = `$${data.session.cost.toFixed(4)}`;
+    renderCostModels(data.session.by_model);
+    setMode(data.mode, data.model, data.serious_seconds_left);
     renderCalendar(data.next_event);
   } catch (error) {
-    addLog("system", `status check failed: ${error}`);
+    if (!quiet) addLog("system", `status check failed: ${error}`);
+  } finally {
+    statusInFlight = false;
+    if (statusAgain) {
+      statusAgain = false;
+      refreshStatus({ quiet: true });
+    }
   }
 }
 
@@ -255,8 +332,12 @@ form.addEventListener("submit", async (event) => {
       }
       addLog("jarvis", data.reply);
       speak(data.reply);
-      pushBar(data.turn_tokens || 0);
+      if (!data.fixed) pushBar(data.turn_tokens || 0); // mode commands cost no tokens
       costEl.textContent = `$${data.session_cost.toFixed(4)}`;
+      setMode(data.mode, data.model); // refreshStatus() in `finally` adds the idle countdown
+      if (data.refused) addLog("system", `request refused${data.refusal_category ? ` (${data.refusal_category})` : ""}`);
+      if (data.fallback) addLog("system", "fallback: answered by the normal model");
+      if (data.truncated) addLog("system", "answer cut off at the length limit");
     }
   } catch (error) {
     addLog("system", `connection error: ${error}`);
@@ -291,4 +372,5 @@ if (window.pywebview) {
 }
 
 refreshStatus();
+setInterval(() => refreshStatus({ quiet: true }), 60000); // catches an idle switch-off or a mode change made elsewhere
 input.focus();

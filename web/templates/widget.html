@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>Jarvis</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='orb.css') }}">
   <style>
     html, body {
       margin: 0;
@@ -20,11 +21,13 @@
       width: 100%;
       height: 100%;
     }
+    /* Serious mode: the page background loses its blue tint (the orb has its own palette, see orb.css). */
+    html.serious, html.serious body { background: #080506; }
   </style>
 </head>
 <body>
   <div id="widget-stage">
-    <canvas id="orb-canvas"></canvas>
+    <div id="orb-canvas"></div>
   </div>
 
   <script src="{{ url_for('static', filename='orb.js') }}"></script>

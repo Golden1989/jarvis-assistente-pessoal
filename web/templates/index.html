@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Jarvis</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='orb.css') }}">
 </head>
 <body>
   <div class="scanlines"></div>
@@ -14,12 +15,13 @@
       <div class="brand-mark">&#9670;</div>
       <div>
         <div class="brand-title">JARVIS</div>
-        <div class="brand-tagline">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
+        <div class="brand-tagline" id="brand-tagline">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
       </div>
     </div>
     <div class="status-block">
       <div class="status-label">SYSTEM STATUS</div>
       <div class="status-value"><span class="dot" id="status-dot"></span><span id="status-text">OPTIMAL</span></div>
+      <div class="mode-line" id="mode-line">MODE: NORMAL</div>
     </div>
     <div class="clock-block">
       <div class="status-label">LOCAL TIME</div>
@@ -56,6 +58,7 @@
           <span class="metric-label">Session Cost</span>
           <span class="metric-value accent" id="cost">$0.0000</span>
         </div>
+        <div class="cost-models" id="cost-models"></div>
       </section>
 
       <section class="panel">
@@ -69,7 +72,7 @@
 
     <section class="col col-center">
       <div class="radar" id="radar">
-        <canvas id="orb-canvas" class="orb-canvas"></canvas>
+        <div id="orb-canvas" class="orb-canvas"></div>
         <div class="ring ring-outer"></div>
         <div class="crosshair crosshair-x"></div>
         <div class="crosshair crosshair-y"></div>
