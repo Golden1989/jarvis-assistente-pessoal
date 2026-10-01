@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -49,14 +50,32 @@ def get_service():
         if _service is not None:
             return _service
 
+        if os.environ.get("JARVIS_TESTING"):
+            # A test runs with JARVIS_TESTING=1 (see tests/_helpers.py, run_tests.py) and did not
+            # install a fake _service itself - refuse loudly instead of reading the real
+            # token.json/credentials.json and reaching the real Google API. This is the one
+            # central checkpoint every public function here goes through, so it covers reading
+            # the token file, refreshing it, the interactive login flow, and every real API call.
+            raise RuntimeError(
+                "JARVIS_TESTING is set and no fake google_calendar._service was installed - "
+                "refusing to touch the real Google Calendar/token.json from a test."
+            )
+
         creds = None
         if os.path.exists(TOKEN_FILE):
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    # The refresh token itself is dead (revoked, or - common for an app still in
+                    # Google's "Testing" publishing status - expired after about a week), not just
+                    # the short-lived access token. Fall through to a fresh interactive login below
+                    # instead of crashing calendar_login.py / this request.
+                    creds = None
+            if not creds or not creds.valid:
                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
                 creds = flow.run_local_server(port=0)  # opens your browser once
             with open(TOKEN_FILE, "w", encoding="utf-8") as token:
