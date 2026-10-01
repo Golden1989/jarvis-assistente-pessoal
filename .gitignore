@@ -20,6 +20,9 @@ notes.txt.*.bak
 credentials.json
 token.json
 
+# Spotify OAuth refresh token - as sensitive as a password, NEVER commit
+spotify_token.json
+
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 

@@ -38,7 +38,7 @@ def test_rename_and_tool_levels():
     assert jc.TOOL_LEVELS == {
         "get_current_datetime": 0, "web_search": 0, "list_files": 0, "read_file": 0,
         "list_calendar_events": 0, "look_at_screen": 0, "confirm_pending_action": 0,
-        "remember": 1, "update_notes": 1, "open_app": 1, "create_calendar_event": 1,
+        "remember": 1, "update_notes": 1, "open_app": 1, "create_calendar_event": 1, "spotify": 1,
     }
     open_app_tool = next(t for t in jc.TOOLS if t["name"] == "open_app")
     assert set(open_app_tool["input_schema"]["properties"]) == {"name", "folder"}

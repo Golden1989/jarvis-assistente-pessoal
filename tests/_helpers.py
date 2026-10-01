@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-not-real")  # never a real key; never used to call the API
+os.environ.setdefault("SPOTIFY_CLIENT_ID", "fake-spotify-client-id-not-real")  # same idea
 os.environ["JARVIS_TESTING"] = "1"  # google_calendar.get_service() refuses the real API unless a
                                      # test installs its own fake gc._service - see isolate() below
 
@@ -26,7 +27,10 @@ sys.path.insert(0, str(ROOT / "web"))
 import jarvis_core as jc  # noqa: E402
 import google_calendar as gc  # noqa: E402
 import app_launcher as al  # noqa: E402
+import spotify_control as sc  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
+
+import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
 
 server.app.testing = True
 
@@ -58,6 +62,10 @@ def isolate(tmp_path):
     gc._next_event_cache = None
     al.WHITELIST_FILE = tmp_path / "app_whitelist.json"  # does not exist unless a test writes it
     al.reload()
+    sc.TOKEN_FILE = str(tmp_path / "spotify_token.json")  # does not exist unless a test seeds it
+    sc._token = None
+    sc._opener = urllib.request.urlopen   # the REAL one: sc._request() then refuses to use it
+                                          # (JARVIS_TESTING) unless a test installs a fake - see fake_spotify()
 
 
 class FakeClient:
@@ -160,6 +168,100 @@ def fake_launcher():
     finally:
         al.subprocess.Popen = real_popen
         al.os.startfile = real_startfile
+
+
+class _FakeSpotifyResponse:
+    """What spotify_control._request() gets back on a 2xx - a context manager like urlopen's."""
+
+    def __init__(self, status, body, headers=None):
+        import json as _json
+        self.status = status
+        self._body = _json.dumps(body).encode("utf-8") if body is not None else b""
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _fake_spotify_http_error(status, body=None, headers=None):
+    """What urllib raises for a non-2xx: HTTPError IS the file-like object spotify_control reads."""
+    import io
+    import json as _json
+    import urllib.error
+    payload = _json.dumps(body).encode("utf-8") if body is not None else b""
+    return urllib.error.HTTPError(url="https://api.spotify.com/v1/fake", code=status, msg="error",
+                                  hdrs=headers or {}, fp=io.BytesIO(payload))
+
+
+class FakeSpotifyHTTP:
+    """
+    Installed as spotify_control._opener - the ONLY seam spotify_control.py makes a real network
+    call through, so this is a complete fake of the Spotify HTTP API, never the real thing.
+
+    `script` is a list of (status, body, headers) tuples, or callables request -> (status, body,
+    headers), consumed in order, one per call. `calls` records every request made (method, url,
+    JSON body) so a test can assert what was actually sent (e.g. the Retry-After wait happened,
+    the refreshed token was used, exactly one retry occurred).
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def __call__(self, req, timeout=15):
+        import json as _json
+        body = None
+        if req.data:
+            try:
+                body = _json.loads(req.data)   # the Spotify Web API calls (json bodies)
+            except ValueError:
+                body = req.data.decode("ascii")  # the token endpoint (form-encoded), kept as-is
+        self.calls.append({
+            "method": req.get_method(), "url": req.full_url, "body": body,
+            "auth": req.get_header("Authorization"),
+        })
+        if not self.script:
+            raise AssertionError(f"FakeSpotifyHTTP ran out of scripted responses at call #{len(self.calls)}: {self.calls[-1]}")
+        item = self.script.pop(0)
+        status, body, headers = item(req) if callable(item) else item
+        if 200 <= status < 300:
+            return _FakeSpotifyResponse(status, body, headers)
+        raise _fake_spotify_http_error(status, body, headers)
+
+
+@contextlib.contextmanager
+def fake_spotify(script):
+    """`with fake_spotify([...]) as http:` - installs a FakeSpotifyHTTP for the block, restores
+    the real urlopen (so JARVIS_TESTING blocks it again) as soon as the block ends."""
+    http = FakeSpotifyHTTP(script)
+    real_opener = sc._opener
+    sc._opener = http
+    try:
+        yield http
+    finally:
+        sc._opener = real_opener
+
+
+def seed_spotify_token(access_token="fake-access-token", refresh_token="fake-refresh-token", expires_in=3600):
+    """Pretends spotify_login.py already ran - writes straight to the (temp, see isolate())
+    TOKEN_FILE, never the real one, and never a real login. Goes through spotify_control's own
+    guard too (belt and suspenders): calling this before isolate() refuses instead of silently
+    writing to the real spotify_token.json."""
+    import json as _json
+    import time as _time
+    sc._refuse_if_untested_real_file()
+    token = {"access_token": access_token, "refresh_token": refresh_token,
+            "expires_at": _time.time() + expires_in, "scope": sc.SCOPES}
+    with open(sc.TOKEN_FILE, "w", encoding="utf-8") as f:
+        _json.dump(token, f)
+    sc._token = token
+    return token
 
 
 def fake_google_ok(link="https://example.invalid/fake-event"):
