@@ -20,11 +20,14 @@ from jarvis_core import (
     ModelRefusedError,
     SystemPromptProvider,
     call_claude,
+    cancel_pending_actions,
     compose_reply,
     detect_mode_command,
+    detect_stop_command,
     message_language,
     mode_reply,
     refusal_reply,
+    stop_reply,
 )
 
 
@@ -75,12 +78,20 @@ def main():
         lang = message_language(user_input)
 
         # Mode commands ("exit serious mode" is one - it is NOT the bare word
-        # "exit"): fixed reply, no API call, no history, not a MemoryGuard round.
+        # "exit"): fixed reply, no API call, no history, not an ActionGuard round.
         command = detect_mode_command(user_input)
         if command is not None:
             state.set_mode(command[0])
             print(f"\nJarvis: {mode_reply(command)}\n")
             print(status_text(state.snapshot()) + "\n")
+            continue
+
+        # "stop"/"cancel" (the WHOLE message, see detect_stop_command): discard anything held,
+        # right now, no API call, no history, not an ActionGuard round either.
+        stop_lang = detect_stop_command(user_input)
+        if stop_lang is not None:
+            had_pending = cancel_pending_actions()
+            print(f"\nJarvis: {stop_reply(stop_lang, had_pending)}\n")
             continue
 
         state.touch()  # expires an idle serious mode first, then counts as use

@@ -20,6 +20,9 @@ notes.txt.*.bak
 credentials.json
 token.json
 
+# Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
+app_whitelist.json
+
 # Local editor config (contains machine-specific paths)
 .vscode/
 

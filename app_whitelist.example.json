@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this to app_whitelist.json (gitignored) and fill in YOUR real paths. open_app only ever opens what is listed here - see app_launcher.py for the two entry shapes and what each field does.",
+  "spotify": {
+    "type": "uri",
+    "target": "spotify:",
+    "aliases": []
+  },
+  "vscode": {
+    "type": "exe",
+    "path": "C:\\REPLACE\\WITH\\REAL\\PATH\\Code.exe",
+    "args": ["--new-window"],
+    "accepts_folder": true,
+    "aliases": ["vs code", "visual studio code", "code"]
+  },
+  "operagx": {
+    "type": "exe",
+    "path": "C:\\REPLACE\\WITH\\REAL\\PATH\\opera.exe",
+    "args": [],
+    "accepts_folder": false,
+    "aliases": ["opera gx", "opera", "gx", "browser"]
+  }
+}

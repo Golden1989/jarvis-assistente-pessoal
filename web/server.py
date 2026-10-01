@@ -24,8 +24,8 @@ import wake_health
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
     CallInfo, ModeState, ModelRefusedError, SystemPromptProvider,
-    call_claude, compose_reply, detect_mode_command, message_language,
-    mode_reply, refusal_reply,
+    call_claude, cancel_pending_actions, compose_reply, detect_mode_command,
+    detect_stop_command, message_language, mode_reply, refusal_reply, stop_reply,
 )
 
 app = Flask(__name__)
@@ -110,16 +110,32 @@ def chat():
         return _chat(user_input)
 
 
+@app.route("/cancel", methods=["POST"])
+def cancel():
+    """Dashboard 'stop' button: discard any held action right now. No API call, no history -
+    same chat_lock as /chat just to serialize cleanly against one in flight."""
+    with chat_lock:
+        had_pending = cancel_pending_actions()
+    return jsonify({"had_pending": had_pending})
+
+
 def _chat(user_input):
     lang = message_language(user_input)
 
     # Mode commands: her own words only, BEFORE anything is appended to the
-    # history and before MemoryGuard's begin_round. Fixed reply, no API call.
+    # history and before ActionGuard's begin_round. Fixed reply, no API call.
     # set_mode restarts the idle timer, so a command counts as use.
     command = detect_mode_command(user_input)
     if command is not None:
         mode_state.set_mode(command[0])
         return jsonify(_payload(mode_reply(command), fixed=True))
+
+    # "stop"/"cancel" (the WHOLE message): discard anything held, right now, no API call, no
+    # history, not an ActionGuard round - same precedence slot as mode commands.
+    stop_lang = detect_stop_command(user_input)
+    if stop_lang is not None:
+        had_pending = cancel_pending_actions()
+        return jsonify(_payload(stop_reply(stop_lang, had_pending), fixed=True))
 
     mode_state.touch()  # expires an idle serious mode first, then counts as use
     mode = mode_state.current()

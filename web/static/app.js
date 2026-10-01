@@ -10,6 +10,7 @@ const button = form.querySelector('button[type="submit"]');
 const micBtn = document.getElementById("mic-btn");
 const langBtn = document.getElementById("lang-btn");
 const muteBtn = document.getElementById("mute-btn");
+const stopBtn = document.getElementById("stop-btn");
 const costEl = document.getElementById("cost");
 const tokInEl = document.getElementById("tok-in");
 const tokOutEl = document.getElementById("tok-out");
@@ -254,6 +255,18 @@ muteBtn.addEventListener("click", () => {
   localStorage.setItem("jarvis-muted", voiceMuted);
   updateMuteButton();
   if (voiceMuted && window.speechSynthesis) window.speechSynthesis.cancel();
+});
+
+// Cancels a held action (remember/update_notes/open_app/create_calendar_event waiting for a
+// "yes") without going through the model at all - same effect as typing "stop"/"cancel".
+stopBtn.addEventListener("click", async () => {
+  try {
+    const res = await fetch("/cancel", { method: "POST" });
+    const data = await res.json();
+    addLog("system", data.had_pending ? "Cancelled." : "Nothing to cancel.");
+  } catch (error) {
+    addLog("system", `cancel failed: ${error}`);
+  }
 });
 
 function looksPortuguese(text) {

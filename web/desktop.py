@@ -34,7 +34,7 @@ import app_log
 import voice_capture
 import wake_word
 from server import app
-from jarvis_core import REPLY_LANGUAGE
+from jarvis_core import REPLY_LANGUAGE, detect_stop_command
 
 SERVER_URL = "http://127.0.0.1:5000"
 
@@ -259,6 +259,12 @@ def _handle_wake():
                 continue  # keep listening; the conversation window is not reset
             noise_in_a_row = 0
 
+            # "stop"/"cancel": goes through /chat like anything else (it clears whatever is held
+            # there and gets the usual fixed reply), but here it ALSO ends the conversation -
+            # the voice equivalent of "qualquer tarefa em andamento" there is no other task than
+            # this listening loop itself.
+            is_stop = detect_stop_command(text) is not None
+
             print(f"[desktop] sending: {text!r} (lang={detected_lang})", flush=True)
             _set_thinking(True)
             reply, mode = _ask_jarvis(text, detected_lang)
@@ -274,6 +280,9 @@ def _handle_wake():
 
             reply_lang = "pt-BR" if (REPLY_LANGUAGE or detected_lang or "").startswith("pt") else "en-US"
             _speak_and_wait(reply, reply_lang)
+            if is_stop:
+                print("[desktop] stop/cancel heard - ending conversation", flush=True)
+                break
             deadline = time.monotonic() + CONVERSATION_WINDOW_SECONDS  # reset after each real turn
     finally:
         wake_word.resume()
