@@ -58,6 +58,9 @@ def test_jarvis_testing_blocks_real_token_file_access():
     real_token_file = sc.TOKEN_FILE
     sc.TOKEN_FILE = sc._DEFAULT_TOKEN_FILE   # ...undo that, simulating "no test path installed"
     sc._token = None
+    real_path = Path(sc._DEFAULT_TOKEN_FILE)
+    before = real_path.read_bytes() if real_path.exists() else None   # may legitimately already
+                                                                       # exist (a real login) - must stay untouched
     try:
         try:
             sc._load_token()
@@ -77,7 +80,8 @@ def test_jarvis_testing_blocks_real_token_file_access():
     finally:
         sc.TOKEN_FILE = real_token_file
         sc._token = None
-    assert not Path(sc._DEFAULT_TOKEN_FILE).exists()   # the real file was never touched
+    after = real_path.read_bytes() if real_path.exists() else None
+    assert after == before   # the real file (present or not) was never read-then-rewritten or touched
 
 
 def test_installing_a_fake_opener_is_still_allowed():
@@ -194,6 +198,37 @@ def test_missing_premium_403_gives_clear_message():
     tool_result = cl.sent[-1]["messages"][-1]["content"][0]["content"]
     assert "Spotify:" in tool_result and "Premium" in tool_result
     assert "{" not in tool_result   # never the raw JSON error body
+
+
+def test_success_status_with_non_json_body_does_not_crash():
+    """Regression: play/pause/next/previous/volume normally answer 204 with an empty body, but a
+    success status is no guarantee of a valid JSON body in practice (an intermediate proxy/CDN hop
+    can still attach stray bytes to an officially "empty" 204) - this really happened and crashed
+    the WHOLE /chat request with an unhandled JSONDecodeError (500, not a clean "Spotify: ..."
+    reply) on both 'pause' and 'next'."""
+    for action, label in [("pause", "Paused."), ("next", "Skipped to the next track.")]:
+        work = tmp()
+        cl = fresh_server(work, [R("tool_use", [TU("t1", "spotify", {"action": action})]), R("end_turn", [T("ok")])])
+        seed_spotify_token()
+        with fake_spotify([(204, b"\n", {})]), quiet(io.StringIO()):
+            r = post_chat(f"{action} the music").get_json()
+        assert "error" not in r, (action, r)   # a clean JSON reply, not a Flask 500/HTML page
+        tool_result = cl.sent[-1]["messages"][-1]["content"][0]["content"]
+        assert tool_result == label, (action, tool_result)
+
+
+def test_refresh_with_invalid_grant_gives_clear_message():
+    """A revoked/expired refresh token (Spotify's token endpoint answers the refresh with an
+    HTTPError, e.g. 400 invalid_grant) must surface as a clear SpotifyError, not a crash - the
+    same class of bug as the success-path one above, just on the OAuth token endpoint."""
+    work = tmp()
+    cl = fresh_server(work, [R("tool_use", [TU("t1", "spotify", {"action": "status"})]), R("end_turn", [T("ok")])])
+    seed_spotify_token()
+    with fake_spotify([(401, {}, {}), (400, {"error": "invalid_grant", "error_description": "Refresh token revoked"}, {})]), quiet(io.StringIO()):
+        r = post_chat("what's playing").get_json()
+    assert "error" not in r
+    tool_result = cl.sent[-1]["messages"][-1]["content"][0]["content"]
+    assert "Spotify login failed" in tool_result and "revoked" in tool_result.lower()
 
 
 def test_rate_limit_429_waits_short_retry_after_then_retries():

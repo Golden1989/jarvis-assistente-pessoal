@@ -86,11 +86,31 @@ def _request(req, timeout=15):
 
 
 def _token_request(data):
+    """POSTs to the token endpoint (authorization_code or refresh_token grant). Raises
+    SpotifyError - never a raw HTTPError/JSONDecodeError - on a rejected or malformed response, so
+    callers (get_access_token, _do_spotify's SpotifyError handling) always see a clear message
+    instead of a crash: this is exactly how a revoked/expired refresh token would show up."""
     body = urllib.parse.urlencode(data).encode("ascii")
     req = urllib.request.Request(f"{AUTH_BASE}/api/token", data=body,
                                   headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
-    with _request(req) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with _request(req) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            error_body = json.loads(raw) or {}
+            detail = error_body.get("error_description") or error_body.get("error")
+        except ValueError:
+            detail = None
+        raise SpotifyError(
+            f"Spotify login failed (HTTP {error.code}){': ' + _clean_name(detail, 120) if detail else ''} - "
+            "try spotify_login.py again."
+        ) from error
+    try:
+        return json.loads(raw)
+    except ValueError as error:
+        raise SpotifyError("Spotify's token endpoint returned something unreadable - try again.") from error
 
 
 def _refuse_if_untested_real_file():
@@ -198,14 +218,19 @@ def _api_call(method, path, params=None, json_body=None):
     try:
         with _request(req) as resp:
             raw = resp.read()
-            return resp.status, (json.loads(raw) if raw else None), resp.headers
+            status, headers = resp.status, resp.headers
     except urllib.error.HTTPError as error:
         raw = error.read()
-        try:
-            body = json.loads(raw) if raw else None
-        except ValueError:
-            body = None
-        return error.code, body, error.headers
+        status, headers = error.code, error.headers
+    try:
+        # play/pause/next/previous/volume normally answer 204 with an empty body, but a success
+        # status is no guarantee of a valid (or any) JSON body in practice - a non-empty-but-not-
+        # JSON response here must never crash the whole /chat request (this really happened: an
+        # intermediate proxy/CDN hop can still attach a stray byte or two to an officially "empty" 204).
+        body = json.loads(raw) if raw else None
+    except ValueError:
+        body = None
+    return status, body, headers
 
 
 def _authed_call(method, path, params=None, json_body=None, _refreshed=False, _rate_limited=False):

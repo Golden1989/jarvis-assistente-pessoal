@@ -7,5 +7,5 @@ jarvis.py can use your calendar afterward without asking again.
 
 import google_calendar
 
-google_calendar.get_service()
+google_calendar.get_service(allow_interactive_login=True)
 print("Google Calendar authorized. token.json saved.")

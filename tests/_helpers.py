@@ -176,7 +176,11 @@ class _FakeSpotifyResponse:
     def __init__(self, status, body, headers=None):
         import json as _json
         self.status = status
-        self._body = _json.dumps(body).encode("utf-8") if body is not None else b""
+        if isinstance(body, (bytes, bytearray)):
+            self._body = bytes(body)   # raw, pre-encoded - e.g. a non-JSON body on a 2xx (see
+                                       # test_success_status_with_non_json_body_does_not_crash)
+        else:
+            self._body = _json.dumps(body).encode("utf-8") if body is not None else b""
         self.headers = headers or {}
 
     def __enter__(self):
