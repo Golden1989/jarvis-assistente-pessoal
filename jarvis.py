@@ -16,12 +16,17 @@ from jarvis_core import (
     SERIOUS_IDLE_MINUTES,
     TOOLS,
     CallInfo,
+    DailyLimitError,
     ModeState,
     ModelRefusedError,
     SystemPromptProvider,
+    allow_more_reply,
+    allow_more_today,
     call_claude,
     cancel_pending_actions,
     compose_reply,
+    daily_limit_reply,
+    detect_allow_more_command,
     detect_mode_command,
     detect_stop_command,
     message_language,
@@ -94,6 +99,14 @@ def main():
             print(f"\nJarvis: {stop_reply(stop_lang, had_pending)}\n")
             continue
 
+        # "allow more today" (the WHOLE message): her own words only, same precedence slot as
+        # the mode/stop commands above - no API call, never triggerable by the model or a tool.
+        allow_lang = detect_allow_more_command(user_input)
+        if allow_lang is not None:
+            allow_more_today()
+            print(f"\nJarvis: {allow_more_reply(allow_lang)}\n")
+            continue
+
         state.touch()  # expires an idle serious mode first, then counts as use
         mode = state.current()
         idle_notice = None
@@ -106,6 +119,10 @@ def main():
 
         try:
             response, _, _ = call_claude(client, prompts.get(), messages, mode=mode, state=state, info=info)
+        except DailyLimitError as limit_error:
+            del messages[checkpoint:]  # no API call was made; the message leaves no trace in history
+            print(f"\nJarvis: {daily_limit_reply(lang, limit_error.limit)}\n")
+            continue
         except ModelRefusedError:
             del messages[checkpoint:]  # the refused message leaves the history; the mode does not change
             print(f"\nJarvis: {refusal_reply(lang, state, info)}\n")

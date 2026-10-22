@@ -23,8 +23,9 @@ import google_calendar
 import wake_health
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
-    CallInfo, ModeState, ModelRefusedError, SystemPromptProvider,
-    call_claude, cancel_pending_actions, compose_reply, detect_mode_command,
+    CallInfo, DailyLimitError, ModeState, ModelRefusedError, SystemPromptProvider,
+    allow_more_reply, allow_more_today, call_claude, cancel_pending_actions, compose_reply,
+    daily_limit_reply, daily_spend_status, detect_allow_more_command, detect_mode_command,
     detect_stop_command, message_language, mode_reply, refusal_reply, stop_reply,
 )
 
@@ -79,6 +80,7 @@ def status():
         upcoming = None
 
     snap = mode_state.snapshot()  # no chat_lock, no touch()
+    today_spent, daily_limit = daily_spend_status()
     return jsonify(
         {
             "tools": [t["name"] for t in TOOLS],
@@ -87,6 +89,8 @@ def status():
             "serious_seconds_left": snap["serious_seconds_left"],
             "cost_alert_step": snap["cost_alert_step"],
             "session": {k: snap[k] for k in ("input_tokens", "output_tokens", "cost", "by_model")},
+            "today_spent": round(today_spent, 4),
+            "daily_limit": round(daily_limit, 4),
             "next_event": upcoming,
             "wake_word": wake_health.snapshot(),
         }
@@ -137,6 +141,13 @@ def _chat(user_input):
         had_pending = cancel_pending_actions()
         return jsonify(_payload(stop_reply(stop_lang, had_pending), fixed=True))
 
+    # "allow more today" (the WHOLE message): her own words only, same precedence slot as the
+    # mode/stop commands above - no API call, never triggerable by the model or by tool content.
+    allow_lang = detect_allow_more_command(user_input)
+    if allow_lang is not None:
+        allow_more_today()
+        return jsonify(_payload(allow_more_reply(allow_lang), fixed=True))
+
     mode_state.touch()  # expires an idle serious mode first, then counts as use
     mode = mode_state.current()
     idle_notice = None
@@ -149,6 +160,10 @@ def _chat(user_input):
     try:
         response, in_tokens, out_tokens = call_claude(
             client, prompts.get(), messages, mode=mode, state=mode_state, info=info)
+    except DailyLimitError as limit_error:
+        del messages[checkpoint:]  # no API call was made; the message leaves no trace in history
+        return jsonify(_payload(daily_limit_reply(lang, limit_error.limit), fixed=True,
+                                daily_limit=True))  # HTTP 200: the voice speaks it, same as a refusal
     except ModelRefusedError as refusal:
         del messages[checkpoint:]  # the refused message leaves the history; the mode does not change
         return jsonify(_payload(refusal_reply(lang, mode_state, info), refused=True,

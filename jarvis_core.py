@@ -18,6 +18,7 @@ from pathlib import Path
 from PIL import ImageGrab
 
 import app_launcher
+import daily_spend
 import google_calendar
 import spotify_control
 
@@ -36,6 +37,10 @@ DEFAULT_MODE = "normal"
 FALLBACK_MODE = "normal"        # where a refused request is retried, once
 SERIOUS_IDLE_MINUTES = 15       # serious mode switches itself off after this much silence
 COST_ALERT_USD = 0.50           # session-cost warning, repeated at every multiple of this
+DAILY_LIMIT_USD = 1.00          # hard daily cap on the Claude API, in addition to today's bonus
+DAILY_LIMIT_BONUS_USD = 1.00    # how much "allow more today" adds to TODAY's limit, per use
+WEB_SEARCH_COST_USD = 0.01      # the API's published price per web_search server-tool call
+DAILY_WARNING_FRACTION = 0.8    # one-time notice once today's spend crosses this share of the limit
 
 # Fixed replies for mode commands - no API call. (action, language) -> text.
 MODE_REPLIES = {
@@ -88,6 +93,14 @@ NOTICES = {
                    "pt": "Aviso: o custo da sessão passou de US$ {amount:.2f}."},
     "idle_revert": {"en": "Serious mode switched itself off after {minutes} minutes without use.",
                     "pt": "O modo sério se desligou sozinho após {minutes} minutos sem uso."},
+    "daily_limit": {"en": "Daily limit of ${limit:.2f} reached. Say 'allow more today' to add $1, "
+                          "or it resets tomorrow.",
+                    "pt": "Limite diário de US$ {limit:.2f} atingido. Diga \"libera mais hoje\" "
+                          "para adicionar US$ 1, ou ele reseta amanhã."},
+    "daily_limit_warning": {"en": "Heads up: today's spending passed 80% of the daily limit.",
+                            "pt": "Aviso: o gasto de hoje passou de 80% do limite diário."},
+    "allow_more_today": {"en": "Added $1.00 to today's limit.",
+                         "pt": "Adicionado US$ 1,00 ao limite de hoje."},
 }
 # Tools whose success changes something outside the conversation. If one of
 # them succeeded before a double refusal, the reply says so (she must not
@@ -152,6 +165,7 @@ PROTECTED_PATHS = [
     Path(google_calendar.TOKEN_FILE).resolve(),
     Path(google_calendar.CREDENTIALS_FILE).resolve(),
     Path(spotify_control.TOKEN_FILE).resolve(),
+    Path(daily_spend.SPEND_FILE).resolve(),
     Path(NOTES_FILE).resolve(),
     (_BASE_DIR / "logs").resolve(),
 ]
@@ -967,6 +981,10 @@ class ActionGuard:
 
 
 _guard = ActionGuard()   # one user, one session - same assumption as server.py's `messages`
+# Lazy: constructing this does NO disk I/O (see DailySpend's docstring) - the real spend_log.json
+# is only ever touched on the first add()/add_bonus()/snapshot() call. Tests repoint this whole
+# object at a temp path - see tests/_helpers.py: isolate().
+_daily_spend = daily_spend.DailySpend()
 
 
 def action_notice():
@@ -1056,6 +1074,64 @@ def stop_reply(trigger_lang, had_pending):
     return STOP_REPLY[lang][had_pending]
 
 
+# Whole-message match only, same spirit as STOP_PHRASES - checked on her own typed/spoken text,
+# before any API call, never on model output or on text that came from a tool.
+ALLOW_MORE_PHRASES = {
+    "en": {"allow more today"},
+    "pt": {"libera mais hoje", "liberar mais hoje", "permite mais hoje"},
+}
+
+
+def detect_allow_more_command(text):
+    """'en' | 'pt' when her ENTIRE message is "allow more today" (or its Portuguese
+    equivalents), else None. Deliberately checked only on her own words, in the same precedence
+    slot as detect_stop_command - the model can never trigger this by repeating the phrase back,
+    and neither can text a tool returned."""
+    words = _mode_words(text)
+    if not words:
+        return None
+    normalized = " ".join(words)
+    for lang, phrases in ALLOW_MORE_PHRASES.items():
+        if normalized in phrases:
+            return lang
+    return None
+
+
+def allow_more_today():
+    """Adds DAILY_LIMIT_BONUS_USD to TODAY's bonus only (see DailySpend.add_bonus) - never to
+    `spent`, so it does not carry over once the day rolls."""
+    _daily_spend.add_bonus(DAILY_LIMIT_BONUS_USD)
+
+
+def allow_more_reply(trigger_lang):
+    lang = REPLY_LANGUAGE or trigger_lang
+    return NOTICES["allow_more_today"][lang]
+
+
+def daily_limit_reply(lang, limit):
+    return NOTICES["daily_limit"][lang].format(limit=limit)
+
+
+def daily_spend_status():
+    """(today_spent, effective_daily_limit) for /status - the limit already includes today's
+    "allow more today" bonus, if any."""
+    spent, bonus = _daily_spend.snapshot()
+    return spent, DAILY_LIMIT_USD + bonus
+
+
+def _token_cost(model, input_tokens, output_tokens):
+    """Pure price-table lookup, shared by ModeState.add_usage and the daily-spend bookkeeping in
+    _call_claude_loop (so both use the exact same prices and the same unknown-model fallback)."""
+    prices = {m["model"]: m for m in MODES.values()}
+    entry = prices.get(model)
+    if entry is None:
+        print(f"[mode] unknown model {model!r} in usage - charging the highest known price", flush=True)
+        entry = {"input_price": max(m["input_price"] for m in MODES.values()),
+                 "output_price": max(m["output_price"] for m in MODES.values())}
+    n_in, n_out = int(input_tokens or 0), int(output_tokens or 0)
+    return n_in / 1_000_000 * entry["input_price"] + n_out / 1_000_000 * entry["output_price"]
+
+
 class ModeState:
     """
     Current mode, idle timer, and per-model session cost. Lives in server.py
@@ -1112,7 +1188,7 @@ class ModeState:
             flag, self._reverted = self._reverted, False
             return flag
 
-    def add_usage(self, model, input_tokens, output_tokens):
+    def add_usage(self, model, input_tokens, output_tokens, extra_cost=0.0):
         """
         Adds one API response's usage at THAT model's price. Call it for every
         response, refusals included: whatever the response reports is counted
@@ -1120,15 +1196,11 @@ class ModeState:
         The docs say a refusal before any output is not charged, so this may
         run slightly above the real bill - deliberately conservative.
         Unknown model: charged at the highest known price, with a warning.
+        extra_cost: a non-token cost to add on top (e.g. web_search calls, see
+        WEB_SEARCH_COST_USD) - never multiplied by any per-token price.
         """
-        prices = {m["model"]: m for m in MODES.values()}
-        entry = prices.get(model)
-        if entry is None:
-            print(f"[mode] unknown model {model!r} in usage - charging the highest known price", flush=True)
-            entry = {"input_price": max(m["input_price"] for m in MODES.values()),
-                     "output_price": max(m["output_price"] for m in MODES.values())}
         n_in, n_out = int(input_tokens or 0), int(output_tokens or 0)
-        cost = n_in / 1_000_000 * entry["input_price"] + n_out / 1_000_000 * entry["output_price"]
+        cost = _token_cost(model, n_in, n_out) + extra_cost
         with self._lock:
             row = self.costs.setdefault(model, {"input_tokens": 0, "output_tokens": 0, "cost": 0.0})
             row["input_tokens"] += n_in
@@ -1322,6 +1394,24 @@ class ModelRefusedError(Exception):
         self.category = category
 
 
+class DailyLimitError(Exception):
+    """
+    Today's spending (DAILY_LIMIT_USD + today's "allow more today" bonus) was already at or over
+    the limit when call_claude() was about to start - no API call is made for this message.
+
+    Checked ONCE, right at the top of call_claude(), before begin_round() and before any request:
+    never in the middle of a tool-use loop, so a message already under way always finishes even
+    if it crosses the limit along the way (see _call_claude_loop's _daily_spend.add() calls) -
+    only the NEXT message is refused. That means one message may overshoot the cap slightly;
+    that is accepted on purpose, rather than ever cutting a tool loop off mid tool_use/tool_result
+    (which would corrupt the conversation history).
+    """
+
+    def __init__(self, limit):
+        super().__init__(f"daily limit of ${limit:.2f} reached")
+        self.limit = limit
+
+
 class CallInfo:
     """What happened inside one call_claude(), filled in place (also when it raises)."""
 
@@ -1394,6 +1484,8 @@ def compose_reply(response, info=None, lang="en", state=None):
         step = state.take_cost_alert()
         if step is not None:
             parts.append(NOTICES["cost_alert"][lang].format(amount=step))
+    if _daily_spend.take_80_percent_notice(DAILY_LIMIT_USD):
+        parts.append(NOTICES["daily_limit_warning"][lang])
     return "\n\n".join(parts)
 
 
@@ -1502,6 +1594,10 @@ def call_claude(client, system_prompt, messages, mode=DEFAULT_MODE, state=None, 
     added to it, refusals included. info: optional CallInfo, filled in place.
     """
     info = info if info is not None else CallInfo()
+    spent, bonus = _daily_spend.snapshot()
+    limit = DAILY_LIMIT_USD + bonus
+    if spent >= limit:
+        raise DailyLimitError(limit)
     _guard.begin_round(_latest_user_text(messages))
     try:
         return _call_claude_loop(client, system_prompt, messages, mode, state, info)
@@ -1542,13 +1638,21 @@ def _call_claude_loop(client, system_prompt, messages, mode, state, info):
         n_in = getattr(usage, "input_tokens", None) or 0
         n_out = getattr(usage, "output_tokens", None) or 0
         thinking = getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", None)
+        # web_search is a server tool billed per call ($10/1,000), not per token - a missing field
+        # (an older SDK, or a response that made no search) counts as 0, read defensively.
+        n_searches = getattr(getattr(usage, "server_tool_use", None), "web_search_requests", None) or 0
+        search_cost = n_searches * WEB_SEARCH_COST_USD
         total_input += n_in
         total_output += n_out
         info.usage.append({"model": settings["model"], "input_tokens": n_in,
                            "output_tokens": n_out, "thinking_tokens": thinking})
         if state is not None:
-            state.add_usage(settings["model"], n_in, n_out)
-        print(f"[usage] {settings['model']} in={n_in} out={n_out} thinking={thinking}", flush=True)
+            response_cost = state.add_usage(settings["model"], n_in, n_out, extra_cost=search_cost)
+        else:
+            response_cost = _token_cost(settings["model"], n_in, n_out) + search_cost
+        _daily_spend.add(response_cost)
+        print(f"[usage] {settings['model']} in={n_in} out={n_out} thinking={thinking} "
+              f"web_searches={n_searches}", flush=True)
         # EVERY response (refusals and the fallback's too), before any of its tools run.
         _guard.observe(response.content)
 

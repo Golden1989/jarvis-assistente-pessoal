@@ -28,6 +28,7 @@ import jarvis_core as jc  # noqa: E402
 import google_calendar as gc  # noqa: E402
 import app_launcher as al  # noqa: E402
 import spotify_control as sc  # noqa: E402
+import daily_spend as ds  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
@@ -66,6 +67,7 @@ def isolate(tmp_path):
     sc._token = None
     sc._opener = urllib.request.urlopen   # the REAL one: sc._request() then refuses to use it
                                           # (JARVIS_TESTING) unless a test installs a fake - see fake_spotify()
+    jc._daily_spend = ds.DailySpend(path=tmp_path / "spend_log.json", clock=ds._today)  # fresh, $0/day
 
 
 class FakeClient:

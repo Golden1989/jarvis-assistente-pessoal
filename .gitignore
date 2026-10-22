@@ -23,6 +23,9 @@ token.json
 # Spotify OAuth refresh token - as sensitive as a password, NEVER commit
 spotify_token.json
 
+# Daily API spending cap's persisted running total - machine-specific, never commit
+spend_log.json
+
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 

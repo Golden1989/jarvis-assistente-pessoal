@@ -21,6 +21,7 @@ const calendarBody = document.getElementById("calendar-body");
 const brandTagline = document.getElementById("brand-tagline");
 const modeLine = document.getElementById("mode-line");
 const costModelsEl = document.getElementById("cost-models");
+const dailySpendEl = document.getElementById("daily-spend");
 const DEFAULT_TAGLINE = brandTagline.textContent;
 
 let toolNames = [];
@@ -314,6 +315,7 @@ async function refreshStatus({ quiet = false } = {}) {
     tokOutEl.textContent = data.session.output_tokens;
     costEl.textContent = `$${data.session.cost.toFixed(4)}`;
     renderCostModels(data.session.by_model);
+    dailySpendEl.textContent = `$${data.today_spent.toFixed(2)} / $${data.daily_limit.toFixed(2)}`;
     setMode(data.mode, data.model, data.serious_seconds_left);
     renderCalendar(data.next_event);
     renderWakeHealth(data.wake_word);
