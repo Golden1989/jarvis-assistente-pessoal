@@ -15,20 +15,26 @@ from jarvis_core import (
     NOTICES,
     SERIOUS_IDLE_MINUTES,
     TOOLS,
+    BriefingFailedError,
     CallInfo,
     DailyLimitError,
     ModeState,
     ModelRefusedError,
+    NoBriefingDataError,
     SystemPromptProvider,
     allow_more_reply,
     allow_more_today,
+    briefing_failed_reply,
+    briefing_unavailable_reply,
     call_claude,
     cancel_pending_actions,
     compose_reply,
     daily_limit_reply,
     detect_allow_more_command,
+    detect_briefing_command,
     detect_mode_command,
     detect_stop_command,
+    get_or_run_briefing,
     message_language,
     mode_reply,
     refusal_reply,
@@ -105,6 +111,28 @@ def main():
         if allow_lang is not None:
             allow_more_today()
             print(f"\nJarvis: {allow_more_reply(allow_lang)}\n")
+            continue
+
+        # "good morning" / "bom dia" / "refresh briefing": same precedence slot as the commands
+        # above, but unlike those this CAN cost (a cache miss calls the API once).
+        briefing_command = detect_briefing_command(user_input)
+        if briefing_command is not None:
+            _, force_refresh = briefing_command
+            try:
+                full_text, _, _ = get_or_run_briefing(
+                    client, messages, user_input, force_refresh=force_refresh, state=state)
+            except DailyLimitError as limit_error:
+                print(f"\nJarvis: {daily_limit_reply(lang, limit_error.limit)}\n")
+                continue
+            except NoBriefingDataError as error:
+                print(f"\nJarvis: {briefing_unavailable_reply(lang, error.unavailable)}\n")
+                continue
+            except BriefingFailedError as error:
+                print(f"\nJarvis: {briefing_failed_reply(lang, error.reason)}\n")
+                print(status_text(state.snapshot()) + "\n")  # cost WAS recorded - show it
+                continue
+            print(f"\nJarvis: {full_text}\n")
+            print(status_text(state.snapshot()) + "\n")
             continue
 
         state.touch()  # expires an idle serious mode first, then counts as use

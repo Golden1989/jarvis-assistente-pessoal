@@ -35,6 +35,7 @@ function speak(text, lang, onDone) {
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = lang;
+  utterance.rate = 0.9;
   const match = window.speechSynthesis.getVoices().find((v) => v.lang === lang);
   if (match) utterance.voice = match;
   utterance.onboundary = () => window.Orb && Orb.pulse();

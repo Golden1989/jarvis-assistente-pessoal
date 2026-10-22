@@ -23,10 +23,11 @@ import google_calendar
 import wake_health
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
-    CallInfo, DailyLimitError, ModeState, ModelRefusedError, SystemPromptProvider,
-    allow_more_reply, allow_more_today, call_claude, cancel_pending_actions, compose_reply,
-    daily_limit_reply, daily_spend_status, detect_allow_more_command, detect_mode_command,
-    detect_stop_command, message_language, mode_reply, refusal_reply, stop_reply,
+    BriefingFailedError, CallInfo, DailyLimitError, ModeState, ModelRefusedError, NoBriefingDataError,
+    SystemPromptProvider, allow_more_reply, allow_more_today, briefing_failed_reply,
+    briefing_unavailable_reply, call_claude, cancel_pending_actions, compose_reply, daily_limit_reply,
+    daily_spend_status, detect_allow_more_command, detect_briefing_command, detect_mode_command,
+    detect_stop_command, get_or_run_briefing, message_language, mode_reply, refusal_reply, stop_reply,
 )
 
 app = Flask(__name__)
@@ -147,6 +148,32 @@ def _chat(user_input):
     if allow_lang is not None:
         allow_more_today()
         return jsonify(_payload(allow_more_reply(allow_lang), fixed=True))
+
+    # "good morning" / "bom dia" / "refresh briefing" (the WHOLE message): her own words only,
+    # same precedence slot as the commands above. Unlike those, this CAN cost (a cache miss calls
+    # the API once) - see get_or_run_briefing for the cache/fetch/API-call/history wiring.
+    briefing_command = detect_briefing_command(user_input)
+    if briefing_command is not None:
+        _, force_refresh = briefing_command
+        briefing_info = CallInfo()
+        try:
+            full_text, spoken, was_cached = get_or_run_briefing(
+                client, messages, user_input, force_refresh=force_refresh,
+                state=mode_state, info=briefing_info)
+        except DailyLimitError as limit_error:
+            return jsonify(_payload(daily_limit_reply(lang, limit_error.limit), fixed=True,
+                                    daily_limit=True))  # HTTP 200: the voice speaks it
+        except NoBriefingDataError as error:
+            return jsonify(_payload(briefing_unavailable_reply(lang, error.unavailable), fixed=True))
+        except BriefingFailedError as error:
+            # fixed=False (unlike the other failure replies above): the API WAS actually called
+            # and cost real tokens, so the dashboard's usage bar should reflect it - still HTTP
+            # 200, so the voice speaks the reply like any other failure message.
+            turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in briefing_info.usage)
+            return jsonify(_payload(briefing_failed_reply(lang, error.reason), fixed=False,
+                                    turn_tokens=turn_tokens))
+        turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in briefing_info.usage)
+        return jsonify(_payload(full_text, fixed=was_cached, speak=spoken, turn_tokens=turn_tokens))
 
     mode_state.touch()  # expires an idle serious mode first, then counts as use
     mode = mode_state.current()

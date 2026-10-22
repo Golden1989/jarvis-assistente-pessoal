@@ -198,7 +198,9 @@ def _ask_jarvis(text, detected_lang=None):
     """
     Reuses the same /chat endpoint the browser itself calls, so behavior
     (tools, memory, everything) matches exactly - no logic duplicated here.
-    Returns (reply, mode); (None, None) on any failure.
+    Returns (reply, mode, speak); (None, None, None) on any failure. `speak` is the short spoken
+    version for a reply that has one (today: the "good morning" briefing) - None otherwise, so
+    the caller falls back to speaking `reply` in full, unchanged for every other kind of reply.
 
     A voice conversation is long-running, and the model sometimes "sticks"
     to whatever language it last replied in instead of matching each new
@@ -223,10 +225,10 @@ def _ask_jarvis(text, detected_lang=None):
         )
         with urllib.request.urlopen(request, timeout=CHAT_TIMEOUT_SECONDS) as response:
             data = json.loads(response.read())
-        return data.get("reply"), data.get("mode")
+        return data.get("reply"), data.get("mode"), data.get("speak")
     except Exception as error:
         print(f"[desktop] _ask_jarvis failed: {error}", flush=True)
-        return None, None
+        return None, None, None
 
 
 def _handle_wake():
@@ -267,7 +269,7 @@ def _handle_wake():
 
             print(f"[desktop] sending: {text!r} (lang={detected_lang})", flush=True)
             _set_thinking(True)
-            reply, mode = _ask_jarvis(text, detected_lang)
+            reply, mode, speak_text = _ask_jarvis(text, detected_lang)
             _set_thinking(False)
             if mode:
                 _set_mode(mode)  # e.g. "Serious mode activating." changes the orb right away
@@ -279,7 +281,9 @@ def _handle_wake():
             print(f"[desktop] replied: {reply!r}", flush=True)
 
             reply_lang = "pt-BR" if (REPLY_LANGUAGE or detected_lang or "").startswith("pt") else "en-US"
-            _speak_and_wait(reply, reply_lang)
+            # The briefing is the one reply with a short spoken version today - everything else
+            # has none (speak_text is None), so the voice speaks the full `reply`, as before.
+            _speak_and_wait(speak_text or reply, reply_lang)
             if is_stop:
                 print("[desktop] stop/cancel heard - ending conversation", flush=True)
                 break

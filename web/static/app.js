@@ -284,6 +284,7 @@ function speak(text) {
   window.speechSynthesis.cancel(); // don't let replies overlap
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = looksPortuguese(text) ? "pt-BR" : "en-US";
+  utterance.rate = 0.9;
 
   const match = window.speechSynthesis.getVoices().find((v) => v.lang === utterance.lang);
   if (match) utterance.voice = match;
@@ -357,7 +358,7 @@ form.addEventListener("submit", async (event) => {
         flashToolsUsed(data.tools_used);
       }
       addLog("jarvis", data.reply);
-      speak(data.reply);
+      speak(data.speak || data.reply);  // e.g. the briefing: full text on screen, a short version spoken
       if (!data.fixed) pushBar(data.turn_tokens || 0); // mode commands cost no tokens
       costEl.textContent = `$${data.session_cost.toFixed(4)}`;
       setMode(data.mode, data.model); // refreshStatus() in `finally` adds the idle countdown

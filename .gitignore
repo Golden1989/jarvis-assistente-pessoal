@@ -26,6 +26,9 @@ spotify_token.json
 # Daily API spending cap's persisted running total - machine-specific, never commit
 spend_log.json
 
+# Today's cached "good morning" briefing - machine-specific, never commit
+briefing_cache.json
+
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 

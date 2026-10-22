@@ -29,6 +29,8 @@ import google_calendar as gc  # noqa: E402
 import app_launcher as al  # noqa: E402
 import spotify_control as sc  # noqa: E402
 import daily_spend as ds  # noqa: E402
+import briefing_cache as bc  # noqa: E402
+import news_sources as ns  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
@@ -68,6 +70,7 @@ def isolate(tmp_path):
     sc._opener = urllib.request.urlopen   # the REAL one: sc._request() then refuses to use it
                                           # (JARVIS_TESTING) unless a test installs a fake - see fake_spotify()
     jc._daily_spend = ds.DailySpend(path=tmp_path / "spend_log.json", clock=ds._today)  # fresh, $0/day
+    jc._briefing_cache = bc.BriefingCache(path=tmp_path / "briefing_cache.json", clock=bc._today)  # fresh, nothing cached
 
 
 class FakeClient:
@@ -304,6 +307,102 @@ def default_whitelist(tmp_path):
     }
     write_whitelist(entries)
     return entries, fake_exe
+
+
+def make_rss_xml(items, doctype=False, entity=False, extra_prolog=b""):
+    """A minimal RSS 2.0 document (bytes) from items: [{"title","link","description","pub_date"}]
+    - for feeding to news_sources.fetch_feed via a fake fetcher, never a real HTTP response."""
+    head = '<?xml version="1.0" encoding="UTF-8"?>\n'
+    if doctype:
+        head += '<!DOCTYPE rss [<!ENTITY x "boom">]>\n' if entity else "<!DOCTYPE rss>\n"
+    parts = [head, "<rss version=\"2.0\"><channel><title>Fake Feed</title>"]
+    for it in items:
+        parts.append(
+            "<item>"
+            f"<title>{it.get('title', '')}</title>"
+            f"<link>{it.get('link', '')}</link>"
+            f"<description>{it.get('description', '')}</description>"
+            f"<pubDate>{it.get('pub_date', '')}</pubDate>"
+            "</item>"
+        )
+    parts.append("</channel></rss>")
+    return extra_prolog + "".join(parts).encode("utf-8")
+
+
+def make_atom_xml(entries):
+    """A minimal Atom document (bytes) from entries: [{"title","link","summary","updated"}]."""
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>\n',
+             '<feed xmlns="http://www.w3.org/2005/Atom"><title>Fake Atom Feed</title>']
+    for e in entries:
+        parts.append(
+            "<entry>"
+            f"<title>{e.get('title', '')}</title>"
+            f"<link href=\"{e.get('link', '')}\"/>"
+            f"<summary>{e.get('summary', '')}</summary>"
+            f"<updated>{e.get('updated', '')}</updated>"
+            "</entry>"
+        )
+    parts.append("</feed>")
+    return "".join(parts).encode("utf-8")
+
+
+def rfc822(dt):
+    """RFC 2822 date string email.utils.parsedate_to_datetime (used by news_sources.py) can read
+    back - e.g. for a test item's <pubDate>."""
+    from email.utils import format_datetime
+    return format_datetime(dt)
+
+
+def fake_news_fetcher(by_url):
+    """
+    A `fetcher(url, timeout=...)` for news_sources.fetch_feed/fetch_all (passed as the `fetcher`
+    argument - never installed as a module-global, since fetch_feed/fetch_all take it as a plain
+    parameter). `by_url`: {feed_url: bytes | BaseException instance | callable(url, timeout)}.
+    Never touches the real network, regardless of JARVIS_TESTING.
+    """
+    def fetcher(url, timeout=6):
+        if url not in by_url:
+            raise AssertionError(f"fake_news_fetcher has no script for {url}")
+        value = by_url[url]
+        if isinstance(value, BaseException):
+            raise value
+        if callable(value):
+            return value(url, timeout)
+        return value
+    return fetcher
+
+
+def fake_fetch_all(items=None, unavailable=None):
+    """A `fetch` callable matching news_sources.fetch_all's own (items, unavailable) return shape
+    - for jarvis_core.run_briefing/get_or_run_briefing tests, which take `fetch` directly (no HTTP
+    layer involved at that level at all)."""
+    def fetch():
+        return list(items or []), list(unavailable or [])
+    return fetch
+
+
+def news_item(source="Fake Source", title="A headline", summary="Why it matters.", link=None):
+    return {"source": source, "title": title, "summary": summary, "link": link}
+
+
+@contextlib.contextmanager
+def fake_news(items=None, unavailable=None):
+    """Patches news_sources.fetch_all - the SAME module-level function jarvis_core.py's
+    run_briefing() reaches by plain attribute lookup (`news_sources.fetch_all`, looked up at call
+    time, never bound at import time) when no explicit `fetch=` is passed, which is exactly what
+    happens on the real /chat path (see web/server.py's call to get_or_run_briefing). This is the
+    one way to exercise that real path end-to-end (post_chat with "good morning") without ever
+    touching the real network. Restores the real fetch_all as soon as the `with` block ends."""
+    real_fetch_all = ns.fetch_all
+
+    def fake(*args, **kwargs):
+        return list(items or []), list(unavailable or [])
+
+    ns.fetch_all = fake
+    try:
+        yield
+    finally:
+        ns.fetch_all = real_fetch_all
 
 
 def run_module_tests(module):
