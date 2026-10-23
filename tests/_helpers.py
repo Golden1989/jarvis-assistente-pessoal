@@ -31,6 +31,7 @@ import spotify_control as sc  # noqa: E402
 import daily_spend as ds  # noqa: E402
 import briefing_cache as bc  # noqa: E402
 import news_sources as ns  # noqa: E402
+import study_store as ss  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
@@ -71,6 +72,8 @@ def isolate(tmp_path):
                                           # (JARVIS_TESTING) unless a test installs a fake - see fake_spotify()
     jc._daily_spend = ds.DailySpend(path=tmp_path / "spend_log.json", clock=ds._today)  # fresh, $0/day
     jc._briefing_cache = bc.BriefingCache(path=tmp_path / "briefing_cache.json", clock=bc._today)  # fresh, nothing cached
+    jc._study_store = ss.StudyStore(path=tmp_path / "study_data.json", clock=ss._today)  # fresh, empty
+    jc._quiz.reset()
 
 
 class FakeClient:
@@ -403,6 +406,23 @@ def fake_news(items=None, unavailable=None):
         yield
     finally:
         ns.fetch_all = real_fetch_all
+
+
+def make_study_entry(id, subject, added_date, last_asked_date=None, last_result=None,
+                     times_asked=0, text="x", kind="summary"):
+    return {"id": id, "subject": subject, "kind": kind, "text": text, "added_date": added_date,
+            "times_asked": times_asked, "last_asked_date": last_asked_date, "last_result": last_result}
+
+
+def seed_study_entries(entries):
+    """Directly seeds jc._study_store's internal list, bypassing add()'s clock/id-assignment -
+    for selection tests that need full control over added_date/last_asked_date/last_result. Call
+    AFTER isolate(). Persists via the store's own _save(), so it round-trips like real data."""
+    store = jc._study_store
+    store._ensure_loaded()  # safe single-threaded: no lock needed for test setup like this
+    store._entries = list(entries)
+    store._next_id = max((e["id"] for e in entries), default=0) + 1
+    store._save()
 
 
 def run_module_tests(module):

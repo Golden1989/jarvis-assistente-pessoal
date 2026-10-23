@@ -29,6 +29,10 @@ spend_log.json
 # Today's cached "good morning" briefing - machine-specific, never commit
 briefing_cache.json
 
+# Personal study notes for the quiz engine - never commit (and never a corrupt-file rename of it)
+study_data.json
+study_data.json.corrupt
+
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 

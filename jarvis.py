@@ -21,6 +21,9 @@ from jarvis_core import (
     ModeState,
     ModelRefusedError,
     NoBriefingDataError,
+    QuizFailedError,
+    QuizNoMaterialError,
+    QuizReviewLimitError,
     SystemPromptProvider,
     allow_more_reply,
     allow_more_today,
@@ -30,14 +33,34 @@ from jarvis_core import (
     cancel_pending_actions,
     compose_reply,
     daily_limit_reply,
+    detect_add_topic_command,
     detect_allow_more_command,
     detect_briefing_command,
     detect_mode_command,
+    detect_quiz_end_command,
+    detect_quiz_review_command,
+    detect_quiz_start_command,
+    detect_save_summary_command,
     detect_stop_command,
+    detect_study_material_command,
+    detect_undo_study_command,
+    end_quiz_command,
     get_or_run_briefing,
+    grade_quiz_answer,
+    handle_save_entry_command,
+    handle_study_material_command,
+    handle_undo_study_command,
+    is_quiz_active,
     message_language,
     mode_reply,
+    quiz_already_active_reply,
+    quiz_bad_response_reply,
+    quiz_limit_hit_reply,
+    quiz_no_material_reply,
+    quiz_review_limit_reply,
     refusal_reply,
+    review_quiz_question,
+    start_quiz,
     stop_reply,
 )
 
@@ -132,6 +155,88 @@ def main():
                 print(status_text(state.snapshot()) + "\n")  # cost WAS recorded - show it
                 continue
             print(f"\nJarvis: {full_text}\n")
+            print(status_text(state.snapshot()) + "\n")
+            continue
+
+        # Study-material save/add/inspect/undo commands - same precedence area as the commands
+        # above, no API call.
+        save_parsed = detect_save_summary_command(user_input)
+        if save_parsed is not None:
+            print(f"\nJarvis: {handle_save_entry_command(save_parsed, 'summary')}\n")
+            continue
+        topic_parsed = detect_add_topic_command(user_input)
+        if topic_parsed is not None:
+            print(f"\nJarvis: {handle_save_entry_command(topic_parsed, 'topic')}\n")
+            continue
+        if detect_study_material_command(user_input):
+            print(f"\nJarvis: {handle_study_material_command()}\n")
+            continue
+        if detect_undo_study_command(user_input):
+            print(f"\nJarvis: {handle_undo_study_command()}\n")
+            continue
+
+        quiz_end_lang = detect_quiz_end_command(user_input)
+        if quiz_end_lang is not None:
+            print(f"\nJarvis: {end_quiz_command(quiz_end_lang)}\n")
+            continue
+
+        quiz_start_lang = detect_quiz_start_command(user_input)
+        if quiz_start_lang is not None:
+            if is_quiz_active():
+                print(f"\nJarvis: {quiz_already_active_reply(quiz_start_lang)}\n")
+                continue
+            quiz_info = CallInfo()
+            try:
+                question_text = start_quiz(client, user_input, state=state, info=quiz_info)
+            except QuizNoMaterialError:
+                print(f"\nJarvis: {quiz_no_material_reply(lang)}\n")
+                continue
+            except DailyLimitError as limit_error:
+                print(f"\nJarvis: {daily_limit_reply(lang, limit_error.limit)}\n")
+                continue
+            except QuizFailedError:
+                print(f"\nJarvis: {quiz_bad_response_reply(lang)}\n")
+                print(status_text(state.snapshot()) + "\n")
+                continue
+            print(f"\nJarvis: {question_text}\n")
+            print(status_text(state.snapshot()) + "\n")
+            continue
+
+        # "review"/"revisao"/"me lembra": consumed ONLY while a quiz is active - otherwise this
+        # falls through, unchanged, to normal chat below. Never routed to the grader.
+        review_lang = detect_quiz_review_command(user_input)
+        if review_lang is not None and is_quiz_active():
+            quiz_info = CallInfo()
+            try:
+                refresher = review_quiz_question(client, state=state, info=quiz_info)
+            except QuizReviewLimitError:
+                print(f"\nJarvis: {quiz_review_limit_reply(lang)}\n")
+                continue
+            except DailyLimitError as limit_error:
+                print(f"\nJarvis: {daily_limit_reply(lang, limit_error.limit)}\n")
+                continue
+            except QuizFailedError:
+                print(f"\nJarvis: {quiz_bad_response_reply(lang)}\n")
+                print(status_text(state.snapshot()) + "\n")
+                continue
+            print(f"\nJarvis: {refresher}\n")
+            print(status_text(state.snapshot()) + "\n")
+            continue
+
+        # Every command above has had its chance - ONLY now does an active quiz claim this
+        # message as an answer to the current question.
+        if is_quiz_active():
+            quiz_info = CallInfo()
+            try:
+                reply_text, _ = grade_quiz_answer(client, messages, user_input, state=state, info=quiz_info)
+            except DailyLimitError as limit_error:
+                print(f"\nJarvis: {quiz_limit_hit_reply(lang, limit_error.limit)}\n")
+                continue
+            except QuizFailedError:
+                print(f"\nJarvis: {quiz_bad_response_reply(lang)}\n")
+                print(status_text(state.snapshot()) + "\n")
+                continue
+            print(f"\nJarvis: {reply_text}\n")
             print(status_text(state.snapshot()) + "\n")
             continue
 

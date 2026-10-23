@@ -24,10 +24,16 @@ import wake_health
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
     BriefingFailedError, CallInfo, DailyLimitError, ModeState, ModelRefusedError, NoBriefingDataError,
-    SystemPromptProvider, allow_more_reply, allow_more_today, briefing_failed_reply,
-    briefing_unavailable_reply, call_claude, cancel_pending_actions, compose_reply, daily_limit_reply,
-    daily_spend_status, detect_allow_more_command, detect_briefing_command, detect_mode_command,
-    detect_stop_command, get_or_run_briefing, message_language, mode_reply, refusal_reply, stop_reply,
+    QuizFailedError, QuizNoMaterialError, QuizReviewLimitError, SystemPromptProvider, allow_more_reply,
+    allow_more_today, briefing_failed_reply, briefing_unavailable_reply, call_claude,
+    cancel_pending_actions, compose_reply, daily_limit_reply, daily_spend_status, detect_add_topic_command,
+    detect_allow_more_command, detect_briefing_command, detect_mode_command, detect_quiz_end_command,
+    detect_quiz_review_command, detect_quiz_start_command, detect_save_summary_command, detect_stop_command,
+    detect_study_material_command, detect_undo_study_command, end_quiz_command, get_or_run_briefing,
+    grade_quiz_answer, handle_save_entry_command, handle_study_material_command, handle_undo_study_command,
+    is_quiz_active, message_language, mode_reply, quiz_already_active_reply, quiz_bad_response_reply,
+    quiz_limit_hit_reply, quiz_no_material_reply, quiz_review_limit_reply, refusal_reply,
+    review_quiz_question, start_quiz, stop_reply,
 )
 
 app = Flask(__name__)
@@ -174,6 +180,78 @@ def _chat(user_input):
                                     turn_tokens=turn_tokens))
         turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in briefing_info.usage)
         return jsonify(_payload(full_text, fixed=was_cached, speak=spoken, turn_tokens=turn_tokens))
+
+    # Study-material save/add/inspect/undo commands - prefix-with-payload or whole-message, her
+    # own words only, no API call, same precedence area as the commands above.
+    save_parsed = detect_save_summary_command(user_input)
+    if save_parsed is not None:
+        return jsonify(_payload(handle_save_entry_command(save_parsed, "summary"), fixed=True))
+    topic_parsed = detect_add_topic_command(user_input)
+    if topic_parsed is not None:
+        return jsonify(_payload(handle_save_entry_command(topic_parsed, "topic"), fixed=True))
+    if detect_study_material_command(user_input):
+        return jsonify(_payload(handle_study_material_command(), fixed=True))
+    if detect_undo_study_command(user_input):
+        return jsonify(_payload(handle_undo_study_command(), fixed=True))
+
+    # "end quiz" always wins over "this message is an answer" - checked before the quiz-start
+    # command and before falling into the grader below.
+    quiz_end_lang = detect_quiz_end_command(user_input)
+    if quiz_end_lang is not None:
+        return jsonify(_payload(end_quiz_command(quiz_end_lang), fixed=True))
+
+    quiz_start_lang = detect_quiz_start_command(user_input)
+    if quiz_start_lang is not None:
+        if is_quiz_active():
+            return jsonify(_payload(quiz_already_active_reply(quiz_start_lang), fixed=True))
+        quiz_info = CallInfo()
+        try:
+            question_text = start_quiz(client, user_input, state=mode_state, info=quiz_info)
+        except QuizNoMaterialError:
+            return jsonify(_payload(quiz_no_material_reply(lang), fixed=True))
+        except DailyLimitError as limit_error:
+            return jsonify(_payload(daily_limit_reply(lang, limit_error.limit), fixed=True,
+                                    daily_limit=True))
+        except QuizFailedError:
+            turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+            return jsonify(_payload(quiz_bad_response_reply(lang), fixed=False, turn_tokens=turn_tokens))
+        turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+        return jsonify(_payload(question_text, fixed=False, turn_tokens=turn_tokens))
+
+    # "review"/"revisao"/"me lembra": consumed ONLY while a quiz is active - otherwise this falls
+    # through, unchanged, to normal chat below. Never routed to the grader.
+    review_lang = detect_quiz_review_command(user_input)
+    if review_lang is not None and is_quiz_active():
+        quiz_info = CallInfo()
+        try:
+            refresher = review_quiz_question(client, state=mode_state, info=quiz_info)
+        except QuizReviewLimitError:
+            return jsonify(_payload(quiz_review_limit_reply(lang), fixed=True))
+        except DailyLimitError as limit_error:
+            return jsonify(_payload(daily_limit_reply(lang, limit_error.limit), fixed=True,
+                                    daily_limit=True))
+        except QuizFailedError:
+            turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+            return jsonify(_payload(quiz_bad_response_reply(lang), fixed=False, turn_tokens=turn_tokens))
+        turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+        return jsonify(_payload(refresher, fixed=False, turn_tokens=turn_tokens))
+
+    # Every command above has had its chance - ONLY now, with none of them matching, does an
+    # active quiz claim this message as an answer to the current question.
+    if is_quiz_active():
+        quiz_info = CallInfo()
+        try:
+            reply_text, _ = grade_quiz_answer(client, messages, user_input, state=mode_state, info=quiz_info)
+        except DailyLimitError as limit_error:
+            # Quiz state is untouched (grade_quiz_answer checks the cap before grading) - she can
+            # continue after "allow more today" or tomorrow, the current question is unchanged.
+            return jsonify(_payload(quiz_limit_hit_reply(lang, limit_error.limit), fixed=True,
+                                    daily_limit=True))
+        except QuizFailedError:
+            turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+            return jsonify(_payload(quiz_bad_response_reply(lang), fixed=False, turn_tokens=turn_tokens))
+        turn_tokens = sum(u["input_tokens"] + u["output_tokens"] for u in quiz_info.usage)
+        return jsonify(_payload(reply_text, fixed=False, turn_tokens=turn_tokens))
 
     mode_state.touch()  # expires an idle serious mode first, then counts as use
     mode = mode_state.current()
