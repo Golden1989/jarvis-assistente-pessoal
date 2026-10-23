@@ -23,6 +23,7 @@ import briefing_cache
 import daily_spend
 import google_calendar
 import news_sources
+import quiz_trigger
 import spotify_control
 import study_store
 
@@ -64,6 +65,13 @@ QUIZ_REVIEW_MAX_TOKENS = 2000
 QUIZ_EFFORT = "medium"          # raised from "low" - grading quality matters more than cost here
 QUIZ_MAX_REVIEWS_PER_QUESTION = 2
 STUDY_NEGLECT_DAYS = 7          # a subject with no new entries in this many days gets a nudge after a quiz
+
+# The daily 16:00 quiz trigger. Named as separate hour/minute ints (NOT datetime.time) because
+# this module already does `import time` (the module, used by ActionGuard's time.monotonic()) -
+# `from datetime import time` would silently shadow that and break every time.monotonic() call.
+QUIZ_TRIGGER_HOUR = 16
+QUIZ_TRIGGER_MINUTE = 0
+QUIZ_SNOOZE_MINUTES = 15
 
 # Fixed replies for mode commands - no API call. (action, language) -> text.
 MODE_REPLIES = {
@@ -181,6 +189,8 @@ NOTICES = {
     "quiz_reviewed_correct_note": {"en": "(You reviewed this one, so it'll come back around again.)",
                                    "pt": "(Você revisou essa, então ela vai voltar a aparecer.)"},
     "quiz_reviews_used": {"en": "Reviews used: {n}.", "pt": "Revisões usadas: {n}."},
+    "quiz_snoozed": {"en": "Snoozed for {minutes} minutes.", "pt": "Adiado por {minutes} minutos."},
+    "quiz_skipped_today": {"en": "Skipped for today.", "pt": "Pulado por hoje."},
 }
 # Tools whose success changes something outside the conversation. If one of
 # them succeeded before a double refusal, the reply says so (she must not
@@ -248,6 +258,7 @@ PROTECTED_PATHS = [
     Path(daily_spend.SPEND_FILE).resolve(),
     Path(briefing_cache.CACHE_FILE).resolve(),
     Path(study_store.STORE_FILE).resolve(),
+    Path(quiz_trigger.TRIGGER_FILE).resolve(),
     Path(NOTES_FILE).resolve(),
     (_BASE_DIR / "logs").resolve(),
 ]
@@ -1069,6 +1080,8 @@ _guard = ActionGuard()   # one user, one session - same assumption as server.py'
 _daily_spend = daily_spend.DailySpend()
 _briefing_cache = briefing_cache.BriefingCache()  # same lazy-loading guarantee, see briefing_cache.py
 _study_store = study_store.StudyStore()  # same lazy-loading guarantee, see study_store.py
+_quiz_trigger_store = quiz_trigger.QuizTriggerStore()  # same lazy-loading guarantee, see quiz_trigger.py
+_quiz_signal_lock = threading.Lock()  # serializes should_signal_quiz() + mark_signaled() as one step
 
 
 def action_notice():
@@ -1329,6 +1342,36 @@ def detect_quiz_review_command(text):
         return None
     normalized = " ".join(words)
     for lang, phrases in QUIZ_REVIEW_PHRASES.items():
+        if normalized in phrases:
+            return lang
+    return None
+
+
+# Whole-message only, her own words only - checked unconditionally (unlike detect_quiz_review_
+# command, these don't require an active quiz: snoozing/skipping act on the 16:00 trigger itself,
+# not on an in-progress quiz session). Checked for collisions against every other phrase set in
+# this file before picking these words.
+QUIZ_SNOOZE_PHRASES = {"en": {"snooze"}, "pt": {"soneca"}}
+QUIZ_SKIP_PHRASES = {"en": {"skip today"}, "pt": {"pular hoje"}}
+
+
+def detect_quiz_snooze_command(text):
+    words = _mode_words(text)
+    if not words:
+        return None
+    normalized = " ".join(words)
+    for lang, phrases in QUIZ_SNOOZE_PHRASES.items():
+        if normalized in phrases:
+            return lang
+    return None
+
+
+def detect_quiz_skip_command(text):
+    words = _mode_words(text)
+    if not words:
+        return None
+    normalized = " ".join(words)
+    for lang, phrases in QUIZ_SKIP_PHRASES.items():
         if normalized in phrases:
             return lang
     return None
@@ -2766,3 +2809,100 @@ def quiz_bad_response_reply(lang="en"):
 
 def quiz_limit_hit_reply(lang, limit):
     return NOTICES["quiz_limit_hit"][lang].format(limit=limit)
+
+
+# --- the 16:00 daily quiz trigger ---------------------------------------
+# Runs every day, weekends included - no weekday/holiday logic. No catch-up for days entirely
+# missed (the laptop was off at 16:00 and never opened again that day): that day's offer is just
+# gone. The only "late" case handled is the SAME day: if Jarvis opens after 16:00, having neither
+# skipped nor signaled yet today, it still offers once - that falls out for free below, since
+# everything is a plain comparison against the current date/time, never a scheduled callback.
+#
+# should_signal_quiz() (the one-shot "pop the window now" check, via check_and_signal_quiz()) and
+# quiz_due_status() (the passive "/status flag, so the dashboard can keep a banner up after the
+# one-shot already fired) share the same eligibility rules via _quiz_eligibility() - they differ
+# only in whether "already signaled since the last eligible moment" also gates the result.
+
+def _quiz_eligibility(now):
+    """(eligible_now, trigger_dt, state) shared by quiz_due_status() and should_signal_quiz().
+    `state` is None when not needed (nothing to check further) - callers that need it regardless
+    also fall through the same way should_signal_quiz() does below."""
+    today = now.date().isoformat()
+    entries = _study_store.all()
+    if not entries:
+        return False, None, None
+    if any(e["last_asked_date"] == today for e in entries):
+        return False, None, None  # a quiz already happened today - never re-nag, no 4th field needed
+    if is_quiz_active():
+        return False, None, None  # never interrupt a quiz already in progress with another "due" pop
+    state = _quiz_trigger_store.snapshot()
+    if state["skipped_date"] == today:
+        return False, None, state
+    trigger_dt = now.replace(hour=QUIZ_TRIGGER_HOUR, minute=QUIZ_TRIGGER_MINUTE, second=0, microsecond=0)
+    if now < trigger_dt:
+        return False, trigger_dt, state
+    if state["snoozed_until"]:
+        snoozed_until_dt = datetime.fromisoformat(state["snoozed_until"])
+        if now < snoozed_until_dt:
+            return False, trigger_dt, state
+    return True, trigger_dt, state
+
+
+def quiz_due_status(now=None):
+    """Passive read for /status: True whenever a quiz is currently due, regardless of whether
+    the one-shot pop-up/pulse already fired today - so the dashboard can keep a persistent
+    banner up after that single signal, without it ever firing a second time."""
+    now = now or datetime.now()
+    eligible, _, _ = _quiz_eligibility(now)
+    return eligible
+
+
+def should_signal_quiz(now=None):
+    """True at most once per 'eligible window' (today's 16:00, or - if she snoozed - the moment
+    the snooze elapses, whichever is later): the one condition check_and_signal_quiz() acts on
+    to fire the actual pop-up+pulse exactly once. Not meant to be called on its own in the real
+    app (nothing marks it signaled) - see check_and_signal_quiz()."""
+    now = now or datetime.now()
+    eligible, trigger_dt, state = _quiz_eligibility(now)
+    if not eligible:
+        return False
+    eligible_since = trigger_dt
+    if state["snoozed_until"]:
+        eligible_since = max(eligible_since, datetime.fromisoformat(state["snoozed_until"]))
+    if state["last_signaled_at"]:
+        if datetime.fromisoformat(state["last_signaled_at"]) >= eligible_since:
+            return False
+    return True
+
+
+def check_and_signal_quiz(now=None):
+    """The one call web/server.py's /quiz/check makes (polled by desktop.py - see Stage B):
+    atomically checks should_signal_quiz() and, if true, marks it signaled before returning -
+    so two near-simultaneous polls can never both fire. Returns True/False."""
+    with _quiz_signal_lock:
+        now = now or datetime.now()
+        if not should_signal_quiz(now):
+            return False
+        _quiz_trigger_store.mark_signaled(now.isoformat())
+        return True
+
+
+def snooze_quiz(now=None):
+    now = now or datetime.now()
+    until = now + timedelta(minutes=QUIZ_SNOOZE_MINUTES)
+    _quiz_trigger_store.mark_snoozed(until.isoformat())
+
+
+def skip_quiz_today(now=None):
+    now = now or datetime.now()
+    _quiz_trigger_store.mark_skipped(now.date().isoformat())
+
+
+def snooze_quiz_reply(trigger_lang="en"):
+    lang = REPLY_LANGUAGE or trigger_lang
+    return NOTICES["quiz_snoozed"][lang].format(minutes=QUIZ_SNOOZE_MINUTES)
+
+
+def skip_quiz_reply(trigger_lang="en"):
+    lang = REPLY_LANGUAGE or trigger_lang
+    return NOTICES["quiz_skipped_today"][lang]

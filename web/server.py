@@ -22,18 +22,20 @@ from flask import Flask, jsonify, render_template, request
 import google_calendar
 import wake_health
 from jarvis_core import (
-    FALLBACK_MODE, NOTICES, SERIOUS_IDLE_MINUTES, TOOLS,
+    FALLBACK_MODE, NOTICES, QUIZ_SNOOZE_MINUTES, SERIOUS_IDLE_MINUTES, TOOLS,
     BriefingFailedError, CallInfo, DailyLimitError, ModeState, ModelRefusedError, NoBriefingDataError,
     QuizFailedError, QuizNoMaterialError, QuizReviewLimitError, SystemPromptProvider, allow_more_reply,
     allow_more_today, briefing_failed_reply, briefing_unavailable_reply, call_claude,
-    cancel_pending_actions, compose_reply, daily_limit_reply, daily_spend_status, detect_add_topic_command,
-    detect_allow_more_command, detect_briefing_command, detect_mode_command, detect_quiz_end_command,
-    detect_quiz_review_command, detect_quiz_start_command, detect_save_summary_command, detect_stop_command,
-    detect_study_material_command, detect_undo_study_command, end_quiz_command, get_or_run_briefing,
-    grade_quiz_answer, handle_save_entry_command, handle_study_material_command, handle_undo_study_command,
-    is_quiz_active, message_language, mode_reply, quiz_already_active_reply, quiz_bad_response_reply,
+    cancel_pending_actions, check_and_signal_quiz, compose_reply, daily_limit_reply, daily_spend_status,
+    detect_add_topic_command, detect_allow_more_command, detect_briefing_command, detect_mode_command,
+    detect_quiz_end_command, detect_quiz_review_command, detect_quiz_skip_command, detect_quiz_snooze_command,
+    detect_quiz_start_command, detect_save_summary_command, detect_stop_command, detect_study_material_command,
+    detect_undo_study_command, end_quiz_command, get_or_run_briefing, grade_quiz_answer,
+    handle_save_entry_command, handle_study_material_command, handle_undo_study_command, is_quiz_active,
+    message_language, mode_reply, quiz_already_active_reply, quiz_bad_response_reply, quiz_due_status,
     quiz_limit_hit_reply, quiz_no_material_reply, quiz_review_limit_reply, refusal_reply,
-    review_quiz_question, start_quiz, stop_reply,
+    review_quiz_question, skip_quiz_reply, skip_quiz_today, snooze_quiz, snooze_quiz_reply, start_quiz,
+    stop_reply,
 )
 
 app = Flask(__name__)
@@ -100,6 +102,7 @@ def status():
             "daily_limit": round(daily_limit, 4),
             "next_event": upcoming,
             "wake_word": wake_health.snapshot(),
+            "quiz_due": quiz_due_status(),
         }
     )
 
@@ -110,6 +113,15 @@ def mode_endpoint():
     (so polling can never keep serious mode alive), no Google Calendar."""
     snap = mode_state.snapshot()
     return jsonify({k: snap[k] for k in ("mode", "model", "serious_seconds_left")})
+
+
+@app.route("/quiz/check")
+def quiz_check():
+    """Polled every 60s by desktop.py's background watcher (Stage B) to decide whether to pop the
+    dashboard and pulse the orb. No chat_lock (same reasoning as /mode: must never queue behind a
+    long chat turn) and no Google Calendar. check_and_signal_quiz() is atomic on its own (a
+    dedicated lock in jarvis_core.py), so two near-simultaneous polls can't both fire."""
+    return jsonify({"signal": check_and_signal_quiz()})
 
 
 @app.route("/chat", methods=["POST"])
@@ -128,6 +140,24 @@ def cancel():
     with chat_lock:
         had_pending = cancel_pending_actions()
     return jsonify({"had_pending": had_pending})
+
+
+@app.route("/quiz/snooze", methods=["POST"])
+def quiz_snooze():
+    """Dashboard 'Snooze 15 min' button - same protection as /cancel: chat_lock, no API call,
+    no history."""
+    with chat_lock:
+        snooze_quiz()
+    return jsonify({"snoozed_minutes": QUIZ_SNOOZE_MINUTES})
+
+
+@app.route("/quiz/skip", methods=["POST"])
+def quiz_skip():
+    """Dashboard 'Skip today' button - same protection as /cancel: chat_lock, no API call,
+    no history."""
+    with chat_lock:
+        skip_quiz_today()
+    return jsonify({"skipped": True})
 
 
 def _chat(user_input):
@@ -193,6 +223,18 @@ def _chat(user_input):
         return jsonify(_payload(handle_study_material_command(), fixed=True))
     if detect_undo_study_command(user_input):
         return jsonify(_payload(handle_undo_study_command(), fixed=True))
+
+    # "snooze"/"soneca" and "skip today"/"pular hoje" (the WHOLE message): act on the 16:00
+    # trigger itself, not on an in-progress quiz - no API call, same precedence area as the
+    # commands above.
+    snooze_lang = detect_quiz_snooze_command(user_input)
+    if snooze_lang is not None:
+        snooze_quiz()
+        return jsonify(_payload(snooze_quiz_reply(snooze_lang), fixed=True))
+    skip_lang = detect_quiz_skip_command(user_input)
+    if skip_lang is not None:
+        skip_quiz_today()
+        return jsonify(_payload(skip_quiz_reply(skip_lang), fixed=True))
 
     # "end quiz" always wins over "this message is an answer" - checked before the quiz-start
     # command and before falling into the grader below.

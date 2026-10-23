@@ -32,6 +32,7 @@ import daily_spend as ds  # noqa: E402
 import briefing_cache as bc  # noqa: E402
 import news_sources as ns  # noqa: E402
 import study_store as ss  # noqa: E402
+import quiz_trigger as qt  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
@@ -74,6 +75,7 @@ def isolate(tmp_path):
     jc._briefing_cache = bc.BriefingCache(path=tmp_path / "briefing_cache.json", clock=bc._today)  # fresh, nothing cached
     jc._study_store = ss.StudyStore(path=tmp_path / "study_data.json", clock=ss._today)  # fresh, empty
     jc._quiz.reset()
+    jc._quiz_trigger_store = qt.QuizTriggerStore(path=tmp_path / "quiz_trigger.json")  # fresh, nothing snoozed/skipped
 
 
 class FakeClient:

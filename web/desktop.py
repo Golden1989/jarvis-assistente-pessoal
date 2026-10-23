@@ -33,6 +33,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import app_log
 import voice_capture
 import wake_word
+from quiz_signal import quiz_signal_action
 from server import app
 from jarvis_core import REPLY_LANGUAGE, detect_stop_command
 
@@ -46,6 +47,9 @@ TASKBAR_ALLOWANCE = 60  # leave room above the Windows taskbar
 CONVERSATION_WINDOW_SECONDS = 90  # how long to keep listening for a follow-up
 CHAT_TIMEOUT_SECONDS = 180  # was 90: /chat is serialized now, and a serious (Opus) turn with tools can take longer
 MODE_POLL_SECONDS = 30  # how often the watcher asks /mode, to catch the idle switch-off
+QUIZ_CHECK_POLL_SECONDS = 60  # how often the watcher asks /quiz/check for the 16:00 trigger
+QUIZ_CHECK_TIMEOUT_SECONDS = 5  # short, so a slow/unreachable server never wedges this thread for long
+PAGE_QUERY_TIMEOUT_SECONDS = 2  # how long to wait for the page to answer a quick evaluate_js question
 MAX_NOISE_IN_A_ROW = 3  # this many ignored "transcriptions" in a row end the conversation
 # What Whisper tends to invent out of silence or background noise. Whole utterance only: any other
 # text, even one word ("weather", "yes", "no"), goes through to Jarvis.
@@ -194,6 +198,99 @@ def _watch_mode():
         time.sleep(MODE_POLL_SECONDS)
 
 
+def _ask_page(js_expression, default):
+    """
+    Evaluates a (fixed, constant - never built from server/user data) JS expression in the
+    CURRENTLY loaded page and returns its boolean result. Uses evaluate_js(js, callback): wrapped
+    in a Promise, pywebview waits for it to resolve and then calls our Python callback with the
+    resolved value - the same pattern _speak_and_wait() already uses to get a result back from
+    JS, here for a yes/no question instead of "the call finished". A threading.Event (`done`) is
+    how the rest of this function blocks until that callback actually runs.
+
+    Returns `default` if the page doesn't answer within PAGE_QUERY_TIMEOUT_SECONDS, or the call
+    itself raises (e.g. no window yet) - each caller below picks whichever default is the safer
+    assumption for what it's asking.
+    """
+    result = {"value": default}
+    done = threading.Event()
+
+    def _on_done(value=None):
+        result["value"] = bool(value)
+        done.set()
+
+    js = f"new Promise((resolve) => resolve({js_expression}));"
+    try:
+        _window.evaluate_js(js, _on_done)
+    except Exception as error:
+        print(f"[desktop] _ask_page failed: {error}", flush=True)
+        return default
+    done.wait(PAGE_QUERY_TIMEOUT_SECONDS)
+    return result["value"]
+
+
+def _has_unsent_chat_input():
+    """Whether the chat input on whichever page is CURRENTLY loaded has unsent text.
+    window.hasUnsentInput is defined on BOTH pages (app.js for the dashboard; widget.js for the
+    widget, which has no input box at all and so always answers False) - the `? :` here is just a
+    second safety net in case a page is ever loaded that doesn't define it. Defaults to False
+    (treated as "input is empty") - the least surprising fallback is to proceed as if nothing was
+    being typed, rather than silently never expanding again."""
+    return _ask_page("window.hasUnsentInput ? window.hasUnsentInput() : false", False)
+
+
+def _is_dashboard_open():
+    """Whether the dashboard (not the small widget) is the page CURRENTLY loaded.
+    window.location.pathname is a plain browser built-in - "/widget" is the widget's own route
+    (see main()'s create_window call and _do_shrink()), anything else (today: "/") is the
+    dashboard. Defaults to True ("dashboard already open") if the page doesn't answer - the
+    safer fallback, since what this guards against is calling _do_expand() while the dashboard
+    is ALREADY showing, which would reload it via load_url() (wiping the on-screen chat log) and
+    reset its size/position for nothing; treating "unknown" as "already open" means we skip that
+    rather than risk doing it when we shouldn't."""
+    return _ask_page('window.location.pathname !== "/widget"', True)
+
+
+def _pulse_orb():
+    if _window is None:
+        return
+    try:
+        _window.evaluate_js("window.Orb && window.Orb.pulse();")  # fixed string - nothing interpolated
+    except Exception:
+        pass  # purely cosmetic - not worth interrupting anything over
+
+
+def _handle_quiz_due_signal():
+    """Runs once per /quiz/check "signal": true (see _watch_quiz_due). Only expands when it's
+    both safe (no unsent text) and useful (the widget, not the dashboard, is showing) - see
+    quiz_signal_action(). Every other case still pulses the orb; the persistent dashboard banner
+    (app.js) covers the rest for whenever she next looks at it herself."""
+    action = quiz_signal_action(_has_unsent_chat_input(), _is_dashboard_open())
+    if action == "expand_and_pulse":
+        _do_expand()
+        # _do_expand() NAVIGATES the window to a new page (load_url) - give its scripts
+        # (orb.js/app.js) a moment to actually run before pulsing, or window.Orb won't exist yet
+        # and the pulse below would silently no-op. No such race in the "pulse_only" branch:
+        # nothing navigates there, so the current page's Orb is already loaded.
+        time.sleep(0.5)
+    _pulse_orb()
+
+
+def _watch_quiz_due():
+    """Background thread, mirrors _watch_mode(): polls /quiz/check every QUIZ_CHECK_POLL_SECONDS.
+    The whole loop body is wrapped in try/except so a request that fails - or the server not
+    being up yet - never kills this thread; it just waits for the next tick and tries again."""
+    time.sleep(2)  # let the window load first, same as _watch_mode()
+    while True:
+        try:
+            with urllib.request.urlopen(f"{SERVER_URL}/quiz/check", timeout=QUIZ_CHECK_TIMEOUT_SECONDS) as response:
+                data = json.loads(response.read())
+            if data.get("signal"):
+                _handle_quiz_due_signal()
+        except Exception as error:
+            print(f"[desktop] quiz-due check failed: {error}", flush=True)
+        time.sleep(QUIZ_CHECK_POLL_SECONDS)
+
+
 def _ask_jarvis(text, detected_lang=None):
     """
     Reuses the same /chat endpoint the browser itself calls, so behavior
@@ -328,6 +425,7 @@ def main():
 
     threading.Thread(target=wake_word.listen_forever, args=(_on_wake_word,), daemon=True).start()
     threading.Thread(target=_watch_mode, daemon=True).start()
+    threading.Thread(target=_watch_quiz_due, daemon=True).start()
 
     # private_mode=False: without this, pywebview wipes cookies and
     # localStorage (language/mute preferences) every time the app restarts.

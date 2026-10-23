@@ -33,6 +33,9 @@ briefing_cache.json
 study_data.json
 study_data.json.corrupt
 
+# 16:00 daily quiz trigger's persisted state - machine-specific, never commit
+quiz_trigger.json
+
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 

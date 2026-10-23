@@ -163,6 +163,44 @@ body {
   box-shadow: 0 0 6px var(--red);
 }
 
+/* The 16:00 quiz-due banner - hidden by default (the HTML `hidden` attribute), shown/hidden
+   purely from app.js reading /status's "quiz_due" flag. */
+.quiz-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 20px 16px;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--accent-text);
+  font-size: 12px;
+  letter-spacing: 0.5px;
+}
+
+/* The browser's own UA stylesheet has a [hidden] { display: none; } rule, but ANY author rule -
+   even one as unrelated as ".quiz-banner { display: flex; }" above - outranks the browser's
+   default styles, regardless of selector specificity. Without this rule, the element stays
+   visibly flex-displayed even with the `hidden` attribute set, because `.quiz-banner` (one
+   class) and `[hidden]` (one attribute) have the SAME specificity, and .quiz-banner's `display:
+   flex` simply comes later in the stylesheet. Repeating `[hidden]` on the selector makes this
+   rule's specificity higher than plain `.quiz-banner`, so it wins regardless of order. */
+.quiz-banner[hidden] { display: none; }
+
+.quiz-banner button {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.quiz-banner button:hover { border-color: var(--blue-glow); }
+
 /* ---------- dashboard grid ---------- */
 
 .dashboard {

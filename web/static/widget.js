@@ -55,6 +55,12 @@ window.setThinking = function (on) {
   if (window.Orb) Orb.setThinking(on);
 };
 
+// Called from desktop.py (evaluate_js) before it decides whether to pop the dashboard forward
+// for the 16:00 quiz signal. The widget has no chat input at all, so there is never anything
+// "unsent" here - the dashboard (app.js) defines the real version of this for when IT is the
+// page currently loaded.
+window.hasUnsentInput = () => false;
+
 // Called from desktop.py (evaluate_js) and once on load.
 window.setMode = function (mode) {
   stage.classList.toggle("serious", mode === "serious");

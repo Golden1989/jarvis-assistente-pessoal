@@ -22,7 +22,16 @@ const brandTagline = document.getElementById("brand-tagline");
 const modeLine = document.getElementById("mode-line");
 const costModelsEl = document.getElementById("cost-models");
 const dailySpendEl = document.getElementById("daily-spend");
+const quizBanner = document.getElementById("quiz-banner");
+const quizSnoozeBtn = document.getElementById("quiz-snooze-btn");
+const quizSkipBtn = document.getElementById("quiz-skip-btn");
 const DEFAULT_TAGLINE = brandTagline.textContent;
+
+// Called from desktop.py (evaluate_js) before it decides whether to pop this window forward for
+// the 16:00 quiz signal - true means "don't move the window, she's mid-typing". Defined here (the
+// dashboard) and, separately, in widget.js (the small orb view has no input box, so it always
+// answers false) - desktop.py calls whichever one the CURRENTLY loaded page defines.
+window.hasUnsentInput = () => input.value.trim().length > 0;
 
 let toolNames = [];
 let barHistory = [];
@@ -270,6 +279,23 @@ stopBtn.addEventListener("click", async () => {
   }
 });
 
+// The 16:00 quiz-due banner: shown/hidden purely from /status's own "quiz_due" flag (see
+// refreshStatus() below) - no extra polling of its own. Both buttons hide it immediately on
+// click (the next /status tick would hide it anyway once the backend records the snooze/skip,
+// but doing it here too means there's no visible one-tick delay).
+function quizSnoozeOrSkip(path) {
+  return async () => {
+    quizBanner.hidden = true;
+    try {
+      await fetch(path, { method: "POST" });
+    } catch (error) {
+      addLog("system", `${path} failed: ${error}`);
+    }
+  };
+}
+quizSnoozeBtn.addEventListener("click", quizSnoozeOrSkip("/quiz/snooze"));
+quizSkipBtn.addEventListener("click", quizSnoozeOrSkip("/quiz/skip"));
+
 function looksPortuguese(text) {
   return /[ãõçáéíóúâêô]/i.test(text) || /\b(você|não|está|para|isso|então)\b/i.test(text);
 }
@@ -320,6 +346,7 @@ async function refreshStatus({ quiet = false } = {}) {
     setMode(data.mode, data.model, data.serious_seconds_left);
     renderCalendar(data.next_event);
     renderWakeHealth(data.wake_word);
+    quizBanner.hidden = !data.quiz_due;
   } catch (error) {
     if (!quiet) addLog("system", `status check failed: ${error}`);
   } finally {
