@@ -39,6 +39,7 @@ def test_rename_and_tool_levels():
         "get_current_datetime": 0, "web_search": 0, "list_files": 0, "read_file": 0,
         "list_calendar_events": 0, "look_at_screen": 0, "confirm_pending_action": 0,
         "remember": 1, "update_notes": 1, "open_app": 1, "create_calendar_event": 1, "spotify": 1,
+        "create_file": 2, "edit_file": 2, "move_file": 2,
     }
     open_app_tool = next(t for t in jc.TOOLS if t["name"] == "open_app")
     assert set(open_app_tool["input_schema"]["properties"]) == {"name", "folder"}
@@ -65,8 +66,8 @@ def test_create_calendar_event_held_after_untrusted_content():
     read_file, list_files, look_at_screen, or list_calendar_events; "yes" then creates it."""
     taint_sources = {
         "web_search": lambda: [SU("s"), SR("s")],
-        "read_file": lambda: [TU("rf", "read_file", {"path": "missing.txt"})],       # harmless: file doesn't exist
-        "list_files": lambda: [TU("lf", "list_files", {})],                         # harmless: lists the temp ALLOWED_FOLDER
+        "read_file": lambda: [TU("rf", "read_file", {"path": "C:\\nonexistent-test-path\\missing.txt"})],  # harmless: no scope configured
+        "list_files": lambda: [TU("lf", "list_files", {"path": "C:\\nonexistent-test-path"})],             # harmless: no scope configured
         "look_at_screen": lambda: [TU("sc", "look_at_screen", {})],                  # mocked: no real screenshot
         "list_calendar_events": lambda: [TU("lc", "list_calendar_events", {"days_ahead": 7})],
     }

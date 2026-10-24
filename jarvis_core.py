@@ -19,13 +19,16 @@ from pathlib import Path
 from PIL import ImageGrab
 
 import app_launcher
+import autonomy_scope
 import briefing_cache
 import daily_spend
+import file_ops
 import google_calendar
 import news_sources
 import quiz_trigger
 import spotify_control
 import study_store
+import undo_log
 
 # --- Modes: everything you may want to tweak lives in these tables ---------
 MODES = {
@@ -246,12 +249,14 @@ NOTE_CATEGORIES = ["projects", "exams", "preferences", "personal", "log"]
 ALLOWED_FOLDER = Path(r"C:\Projetos")
 
 # Resources no tool may ever reach, however a path is spelled (".."", an absolute/UNC path, or a
-# junction/symlink placed inside ALLOWED_FOLDER pointing back out). Checked by a dedicated test,
-# not by _resolve_within_allowed itself - it doesn't need to know these paths by name, since
-# anything outside ALLOWED_FOLDER already fails its own check; this just documents what matters
-# and proves it. See test_action_guard.py: "escapes_protected_paths".
+# junction/symlink placed inside an allowed folder pointing back out). Checked by a dedicated test
+# AND, since autonomy_scope.resolve() is the real permission gate for the multi-folder file tools,
+# actively enforced there on every call - not just proven disjoint from ALLOWED_FOLDER by a test
+# the way it used to be for the old single-folder tools. The whole repo is NOT a blanket entry here
+# any more (it used to be, as `_BASE_DIR`): the repo is now a normal, narrow, read-only scope entry
+# in autonomy_scope.json with `allowed_extensions: [".py", ".md"]`, so it can be read-only-browsable
+# the way she asked, while these specific files stay unreachable regardless of any scope.
 PROTECTED_PATHS = [
-    _BASE_DIR,                                      # the whole project folder, including this file
     Path(app_launcher.WHITELIST_FILE).resolve(),    # app_whitelist.json - Jarvis can't be the one to edit it
     Path(google_calendar.TOKEN_FILE).resolve(),
     Path(google_calendar.CREDENTIALS_FILE).resolve(),
@@ -262,7 +267,18 @@ PROTECTED_PATHS = [
     Path(quiz_trigger.TRIGGER_FILE).resolve(),
     Path(NOTES_FILE).resolve(),
     (_BASE_DIR / "logs").resolve(),
+    Path(autonomy_scope.CONFIG_FILE).resolve(),     # autonomy_scope.json - Jarvis can't edit its own permissions
+    Path(undo_log.UNDO_LOG_FILE).resolve(),         # undo_log.json - never trust the log blindly, not even for reads
+    Path(undo_log.BACKUPS_DIR).resolve(),           # backups\ - same reasoning, hard-vetoed even though it sits
+                                                     # inside the jarvis_workspace read_write scope
 ]
+
+# The two new stores the file tools use - see autonomy_scope.py/undo_log.py/file_ops.py. Built
+# AFTER PROTECTED_PATHS (passed in as a dependency, same shape as app_launcher.resolve()'s
+# resolve_within_allowed callback) so this module stays import-free of jarvis_core, avoiding a
+# circular import.
+_autonomy_scope = autonomy_scope.AutonomyScope(protected_paths=PROTECTED_PATHS, valid_subjects=STUDY_SUBJECTS)
+_undo_log = undo_log.UndoLog()
 
 # Base identity - applies even with no context files (e.g. a fresh clone).
 # Tone, form of address, and personal details live in the context files above.
@@ -407,32 +423,121 @@ TOOLS = [
     {
         "name": "list_files",
         "description": (
-            f"List files and folders inside {ALLOWED_FOLDER} (or a subfolder "
-            "of it). Use this to see what projects or documents exist before "
-            "reading one."
+            "List files and folders inside one of the configured folders below (or a subfolder "
+            "of one). Deny-listed names (credentials, .git, etc.) are never shown; a file whose "
+            "type can't be read still shows its name so you know it exists.\n" + _autonomy_scope.describe()
         ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "subfolder": {
-                    "type": "string",
-                    "description": "Subfolder path relative to the allowed folder. Empty for the top level.",
-                }
-            },
-        },
-    },
-    {
-        "name": "read_file",
-        "description": f"Read the text content of a file inside {ALLOWED_FOLDER}.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File path relative to the allowed folder.",
+                    "description": "Absolute path to list - one of the configured folders, or a subfolder of one.",
                 }
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": (
+            "Read a file inside one of the configured folders below. Plain text "
+            "(.txt/.md/.csv/.log) is read directly; .pdf/.docx/.pptx are extracted. Any other "
+            f"type is refused. Capped at {file_ops.FILE_READ_MAX_CHARS} characters per call - use "
+            "`offset` to keep reading further into the SAME extraction, or `page` to move the "
+            "extraction window itself to a later page/slide/paragraph-block once this tool tells "
+            "you the current one is exhausted - they are not interchangeable: a bigger `offset` "
+            "alone never reaches content beyond the current page/slide/paragraph-block window.\n"
+            + _autonomy_scope.describe()
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to read."},
+                "offset": {
+                    "type": "integer",
+                    "description": "Character offset to continue from - 0 for the start; use the "
+                                   "offset this tool suggests to read further into the same page.",
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "1-based page/slide/paragraph-block to start extracting from "
+                                   "(.pdf/.docx/.pptx only, ignored for plain text) - use the page "
+                                   "number this tool suggests once a page's content is exhausted.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "create_file",
+        "description": (
+            "Create a NEW file (never overwrites - use edit_file for an existing one) inside a "
+            f"configured read-write folder. Only {', '.join(sorted(file_ops.WRITABLE_EXTENSIONS))} "
+            "files can be created - never a script or executable type. ALWAYS held for her "
+            "explicit yes, even in an otherwise clean message - tell her it needs confirmation, "
+            "never say it was created until she confirms. Do NOT ask her for permission in chat "
+            "first - call the tool directly; the system holds it and shows her exactly what will "
+            "happen, and her single 'yes' after that is the confirmation. If it is held, say only "
+            "that it needs her confirmation - never explain why.\n" + _autonomy_scope.describe()
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the new file."},
+                "content": {"type": "string", "description": "The file's full content."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "Replace an EXACT piece of text in an existing file inside a configured read-write "
+            "folder. `old_text` must be copied exactly as it appears and must match the file "
+            "exactly once (zero or several matches both refuse - never guessed); `new_text` is "
+            f"what replaces it. Only {', '.join(sorted(file_ops.WRITABLE_EXTENSIONS))} files can "
+            "be edited. ALWAYS held for her explicit yes, even in an otherwise clean message. Do "
+            "NOT ask her for permission in chat first - call the tool directly; the system holds "
+            "it and shows her exactly what will happen, and her single 'yes' after that is the "
+            "confirmation. If it is held, say only that it needs her confirmation - never explain "
+            "why.\n" + _autonomy_scope.describe()
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to edit."},
+                "old_text": {
+                    "type": "string",
+                    "description": "The exact text to replace - must match the file exactly once.",
+                },
+                "new_text": {"type": "string", "description": "The text to put in its place."},
+            },
+            "required": ["path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "move_file",
+        "description": (
+            "Move or rename a file. BOTH the source and destination must be inside configured "
+            "read-write folders (moving a file OUT of a read-only folder is itself a write to "
+            "that folder, so it is refused). Keeping the same extension is fine for any of "
+            f"{', '.join(sorted(file_ops.MOVABLE_EXTENSIONS))}; CHANGING the extension along the "
+            f"way is only allowed when the destination is one of {', '.join(sorted(file_ops.WRITABLE_EXTENSIONS))}. "
+            "A script or executable type is refused as source or destination either way. Never "
+            "overwrites an existing file at the destination. ALWAYS held for her explicit yes, "
+            "even in an otherwise clean message. Do NOT ask her for permission in chat first - "
+            "call the tool directly; the system holds it and shows her exactly what will happen, "
+            "and her single 'yes' after that is the confirmation. If it is held, say only that it "
+            "needs her confirmation - never explain why.\n" + _autonomy_scope.describe()
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute path of the file to move."},
+                "new_path": {"type": "string", "description": "Absolute destination path."},
+            },
+            "required": ["path", "new_path"],
         },
     },
     {
@@ -554,8 +659,6 @@ TOOLS = [
     },
 ]
 
-MAX_FILE_CHARS = 5000  # cap what a single read_file call can pull into context
-
 
 def _parse_notes():
     """Parse notes.txt into an ordered {category: [lines]} dict."""
@@ -652,14 +755,16 @@ def _backup_notes():
 #   0 - free: read-only / no side effect, never touches this guard.
 #   1 - light, reversible: runs immediately UNLESS this round (or the one right before it - see
 #       TAINT_FOLLOWING_MESSAGES) used untrusted content, in which case it is held.
-#   2 - changes data somewhere else, ALWAYS held regardless of taint. Reserved for future tools
-#       (editing/deleting files or calendar events) - nothing is at this level today.
+#   2 - changes data somewhere else, ALWAYS held regardless of taint. create_file/edit_file/
+#       move_file are here on purpose, not level 1 - this Stage has no "approved plan" fast path
+#       yet, so every file write needs her explicit yes even in an otherwise clean message.
 #   3 - destructive or system-level: refused unconditionally, never executed. Reserved; nothing
 #       is at this level today, and nothing should be without a lot more thought.
 TOOL_LEVELS = {
     "get_current_datetime": 0, "web_search": 0, "list_files": 0, "read_file": 0,
     "list_calendar_events": 0, "look_at_screen": 0, "confirm_pending_action": 0,
     "remember": 1, "update_notes": 1, "open_app": 1, "create_calendar_event": 1, "spotify": 1,
+    "create_file": 2, "edit_file": 2, "move_file": 2,
 }
 
 # Client tools whose results are third-party text. web_search is a server
@@ -866,21 +971,51 @@ def _prep_open_app(tool_input):
     return True, {"name": name, "folder": folder}, value["display"]
 
 
+# Thin wrappers around file_ops.py's prep/do functions - they take `_autonomy_scope`/`_undo_log`
+# explicitly so file_ops.py stays import-free of jarvis_core (the same dependency-injection shape
+# _resolve_within_allowed already uses for app_launcher.resolve()).
+def _prep_create_file(tool_input):
+    return file_ops.prep_create_file(_autonomy_scope, tool_input)
+
+
+def _do_create_file(item_input):
+    return file_ops.do_create_file(_autonomy_scope, _undo_log, item_input)
+
+
+def _prep_edit_file(tool_input):
+    return file_ops.prep_edit_file(_autonomy_scope, tool_input)
+
+
+def _do_edit_file(item_input):
+    return file_ops.do_edit_file(_autonomy_scope, _undo_log, item_input)
+
+
+def _prep_move_file(tool_input):
+    return file_ops.prep_move_file(_autonomy_scope, tool_input)
+
+
+def _do_move_file(item_input):
+    return file_ops.do_move_file(_autonomy_scope, _undo_log, item_input)
+
+
 # tool -> (ok, item_input, display_or_error). The SAME function runs before an immediate
 # execution and before a hold, so an invalid call (unknown app, folder outside ALLOWED_FOLDER) is
 # refused right away either way - it is never held just to be told no on confirmation.
 ACTION_PREP = {
     "remember": _prep_remember, "update_notes": _prep_update_notes,
     "create_calendar_event": _prep_create_calendar_event, "open_app": _prep_open_app,
-    "spotify": _prep_spotify,
+    "spotify": _prep_spotify, "create_file": _prep_create_file, "edit_file": _prep_edit_file,
+    "move_file": _prep_move_file,
 }
 # tool -> item_input -> result string. Runs immediately (clean round) or at confirm() time
 # (re-derived from the stored raw input, so it re-validates: open_app re-checks the app table and
-# the folder, create_calendar_event re-tries Google - nothing here is stale by design).
+# the folder, create_calendar_event re-tries Google, the file tools re-resolve the scope and
+# re-check old_text/existence from scratch - nothing here is stale by design).
 # update_notes is handled separately (ActionGuard._execute_pending): it alone needs base_stamp.
 ACTION_EXECUTE = {
     "remember": _do_remember, "create_calendar_event": _do_create_calendar_event, "open_app": _do_open_app,
-    "spotify": _do_spotify,
+    "spotify": _do_spotify, "create_file": _do_create_file, "edit_file": _do_edit_file,
+    "move_file": _do_move_file,
 }
 # What the model is told when a call is held - and must never claim it already happened.
 ACTION_HOLD_MESSAGE = (
@@ -1302,6 +1437,17 @@ def detect_undo_study_command(text):
     return bool(words) and " ".join(words) == UNDO_STUDY_PHRASE
 
 
+# Whole-message, non-model command, exactly like the study undo above: this is how "undo last
+# file change" can reverse a create/edit/move without ever giving the MODEL (or injected file/web
+# content) a delete capability - only her own literal words reach this, never a tool call.
+UNDO_FILE_CHANGE_PHRASE = "undo last file change"
+
+
+def detect_undo_file_change_command(text):
+    words = _mode_words(text)
+    return bool(words) and " ".join(words) == UNDO_FILE_CHANGE_PHRASE
+
+
 QUIZ_START_PHRASES = {"en": {"quiz me", "start quiz"}, "pt": {"iniciar perguntas"}}
 QUIZ_END_PHRASES = {"en": {"end quiz"}, "pt": {"encerrar perguntas"}}
 
@@ -1415,6 +1561,10 @@ def handle_undo_study_command():
     if removed is None:
         return NOTICES["study_undo_empty"][lang]
     return NOTICES["study_undo_done"][lang].format(subject=removed["subject"], date=removed["added_date"])
+
+
+def handle_undo_file_change_command():
+    return file_ops.undo_last_file_change(_autonomy_scope, _undo_log)
 
 
 def allow_more_today():
@@ -1590,7 +1740,8 @@ def run_tool(name, tool_input):
         now = datetime.now().astimezone()
         return now.strftime("%A, %B %d, %Y - %I:%M %p (%Z)")
 
-    if name in ("remember", "update_notes", "create_calendar_event", "open_app"):
+    if name in ("remember", "update_notes", "create_calendar_event", "open_app",
+                "create_file", "edit_file", "move_file"):
         return _guard.run(name, tool_input)   # validates, then runs now / holds / refuses - see TOOL_LEVELS
 
     if name == "spotify":
@@ -1602,26 +1753,11 @@ def run_tool(name, tool_input):
         return _guard.confirm()   # takes no input on purpose: nothing to tamper with
 
     if name == "list_files":
-        try:
-            target = _resolve_within_allowed(tool_input.get("subfolder") or ".")
-        except ValueError:
-            return "Error: that path is outside the allowed folder."
-        if not target.exists():
-            return f"Folder not found: {target}"
-        entries = sorted(p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
-        return "\n".join(entries) if entries else "(empty folder)"
+        return file_ops.list_files(_autonomy_scope, tool_input.get("path", ""))
 
     if name == "read_file":
-        try:
-            target = _resolve_within_allowed(tool_input["path"])
-        except ValueError:
-            return "Error: that path is outside the allowed folder."
-        if not target.is_file():
-            return f"Not a file: {target}"
-        content = target.read_text(encoding="utf-8", errors="replace")
-        if len(content) > MAX_FILE_CHARS:
-            content = content[:MAX_FILE_CHARS] + "\n...[truncated]"
-        return content
+        return file_ops.read_file(_autonomy_scope, tool_input.get("path", ""),
+                                  tool_input.get("offset", 0), tool_input.get("page", 1))
 
     if name == "list_calendar_events":
         try:

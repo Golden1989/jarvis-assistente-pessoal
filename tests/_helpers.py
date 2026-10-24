@@ -33,6 +33,8 @@ import briefing_cache as bc  # noqa: E402
 import news_sources as ns  # noqa: E402
 import study_store as ss  # noqa: E402
 import quiz_trigger as qt  # noqa: E402
+import autonomy_scope as asc  # noqa: E402
+import undo_log as ul  # noqa: E402
 import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
@@ -76,6 +78,11 @@ def isolate(tmp_path):
     jc._study_store = ss.StudyStore(path=tmp_path / "study_data.json", clock=ss._today)  # fresh, empty
     jc._quiz.reset()
     jc._quiz_trigger_store = qt.QuizTriggerStore(path=tmp_path / "quiz_trigger.json")  # fresh, nothing snoozed/skipped
+    # Fresh, zero folders configured until a test writes its own autonomy_scope.json (see
+    # write_autonomy_scope below) - never the developer's real file or real jarvis_workspace.
+    jc._autonomy_scope = asc.AutonomyScope(path=tmp_path / "autonomy_scope.json",
+                                           protected_paths=jc.PROTECTED_PATHS, valid_subjects=jc.STUDY_SUBJECTS)
+    jc._undo_log = ul.UndoLog(path=tmp_path / "undo_log.json", backups_dir=tmp_path / "backups")
 
 
 class FakeClient:
@@ -312,6 +319,23 @@ def default_whitelist(tmp_path):
     }
     write_whitelist(entries)
     return entries, fake_exe
+
+
+def write_autonomy_scope(folders):
+    """Writes `folders` (a list of dicts: "path", "mode", and optionally "subject"/
+    "allowed_extensions") as autonomy_scope.json at jc._autonomy_scope's own (temp - see isolate())
+    path, creating each folder on disk first if it doesn't exist yet (AutonomyScope refuses an
+    entry whose path isn't a real, existing directory). Call AFTER isolate()."""
+    import json
+    payload = {"folders": []}
+    for entry in folders:
+        path = Path(entry["path"])
+        path.mkdir(parents=True, exist_ok=True)
+        item = {"path": str(path), "mode": entry["mode"], "subject": entry.get("subject")}
+        if "allowed_extensions" in entry:
+            item["allowed_extensions"] = entry["allowed_extensions"]
+        payload["folders"].append(item)
+    jc._autonomy_scope._path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def make_rss_xml(items, doctype=False, entity=False, extra_prolog=b""):

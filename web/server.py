@@ -30,8 +30,9 @@ from jarvis_core import (
     detect_add_topic_command, detect_allow_more_command, detect_briefing_command, detect_mode_command,
     detect_quiz_end_command, detect_quiz_review_command, detect_quiz_skip_command, detect_quiz_snooze_command,
     detect_quiz_start_command, detect_save_summary_command, detect_stop_command, detect_study_material_command,
-    detect_undo_study_command, end_quiz_command, get_or_run_briefing, grade_quiz_answer,
-    handle_save_entry_command, handle_study_material_command, handle_undo_study_command, is_quiz_active,
+    detect_undo_file_change_command, detect_undo_study_command, end_quiz_command, get_or_run_briefing,
+    grade_quiz_answer, handle_save_entry_command, handle_study_material_command,
+    handle_undo_file_change_command, handle_undo_study_command, is_quiz_active,
     message_language, mode_reply, quiz_already_active_reply, quiz_bad_response_reply, quiz_due_status,
     quiz_limit_hit_reply, quiz_no_material_reply, quiz_review_limit_reply, refusal_reply,
     review_quiz_question, skip_quiz_reply, skip_quiz_today, snooze_quiz, snooze_quiz_reply, start_quiz,
@@ -223,6 +224,8 @@ def _chat(user_input):
         return jsonify(_payload(handle_study_material_command(), fixed=True))
     if detect_undo_study_command(user_input):
         return jsonify(_payload(handle_undo_study_command(), fixed=True))
+    if detect_undo_file_change_command(user_input):
+        return jsonify(_payload(handle_undo_file_change_command(), fixed=True))
 
     # "snooze"/"soneca" and "skip today"/"pular hoje" (the WHOLE message): act on the 16:00
     # trigger itself, not on an in-progress quiz - no API call, same precedence area as the

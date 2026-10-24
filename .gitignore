@@ -39,6 +39,9 @@ quiz_trigger.json
 # Real app-launcher config (machine-specific install paths) - see app_whitelist.example.json
 app_whitelist.json
 
+# Real file-autonomy scope config (machine-specific folder paths) - see autonomy_scope.example.json
+autonomy_scope.json
+
 # Local editor config (contains machine-specific paths)
 .vscode/
 

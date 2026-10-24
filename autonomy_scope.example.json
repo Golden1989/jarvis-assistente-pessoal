@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy this to autonomy_scope.json (gitignored) and fill in YOUR real paths. Every folder Jarvis's file tools (list_files/read_file/create_file/edit_file/move_file) can reach is listed here - see autonomy_scope.py for the full resolution rules. mode is \"read_only\" or \"read_write\". subject is optional metadata (one of jarvis_core.STUDY_SUBJECTS) or null. allowed_extensions is optional and only NARROWS what's readable/writable in that folder, never widens it.",
+  "folders": [
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\Caso_Forense", "mode": "read_only", "subject": "forensics"},
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\casos", "mode": "read_only", "subject": "forensics"},
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\Projetos", "mode": "read_only", "subject": null},
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\ciencia_dados", "mode": "read_write", "subject": "data science"},
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\jarvis-assistente-pessoal", "mode": "read_only", "subject": null,
+     "allowed_extensions": [".py", ".md"]},
+    {"path": "C:\\REPLACE\\WITH\\REAL\\PATH\\jarvis_workspace", "mode": "read_write", "subject": null}
+  ]
+}
