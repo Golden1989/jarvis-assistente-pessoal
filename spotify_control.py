@@ -13,6 +13,7 @@ import json
 import os
 import os.path
 import secrets
+import socket
 import threading
 import time
 import urllib.error
@@ -37,6 +38,14 @@ DEVICE_WAIT_SECONDS = 8       # how long to wait for a device to appear after op
 DEVICE_POLL_INTERVAL = 1.0
 RETRY_AFTER_MAX_WAIT = 5      # a 429 with Retry-After at or below this is waited out once and retried
 MAX_NAME_CHARS = 80           # names from Spotify shown to the model are capped this short
+# A search with no market can come back with tracks flagged unavailable even though they're
+# playable in hers - Spotify's own search docs call this out, and since Feb 2026 Dev Mode no
+# longer returns available_markets/linked_from at all, so there's no per-track market list to
+# check against anyway. This is a personal, single-country deployment, so one fixed market is fine.
+SPOTIFY_MARKET = "BR"
+TRANSFER_BEFORE_PLAY_WAIT_SECONDS = 1.0  # give an inactive device a moment to wake up after transfer_playback
+PLAY_VERIFY_POLL_INTERVAL_SECONDS = 1.0  # how often to re-check playback state after play_uri
+PLAY_VERIFY_MAX_POLLS = 4                # ~4s total budget - stop polling early as soon as is_playing is true
 
 _lock = threading.RLock()
 _token = None  # cached dict: access_token, refresh_token, expires_at, scope
@@ -279,6 +288,129 @@ def get_devices():
     return (body or {}).get("devices") or []
 
 
+def _choose_play_device_id(devices):
+    """None (let Spotify pick - today's old behavior) | a device id to pass explicitly to
+    play_uri(). Without an explicit device_id, PUT .../play plays on WHATEVER device Spotify
+    considers active - which can silently be her phone or ANOTHER COMPUTER on the same account,
+    not this one (this really happened: once with a phone active, once with two PCs on the same
+    account and the wrong one picked, and once with the desktop app itself broken for starting
+    playback, needing the browser's Web Player instead - the Web Player's device name looks like
+    "Web Player (Chrome)" and will never equal this machine's hostname).
+
+    Among non-restricted "Computer" devices, in order:
+      (a) a device whose name matches this machine's hostname (socket.gethostname(), compared
+          stripped and case-insensitively) - preferring the is_active one if more than one
+          matches - UNLESS a Web Player device (name starts with "Web Player", case-insensitive)
+          is currently active, in which case that active Web Player wins instead (the desktop app
+          can be broken while the Web Player in the browser is what's actually in use);
+      (b) otherwise, if exactly one Computer device is active, use it;
+      (c) otherwise, if exactly one Computer device is a Web Player, use it;
+      (d) otherwise, if exactly one Computer device exists at all, use it (nothing to disambiguate);
+      (e) otherwise, several Computers and nothing above picked one - do not guess which is "this"
+          one - raise SpotifyError instead.
+      otherwise (no Computer devices at all) return None, so the existing 404 recovery in
+      _with_device_recovery (open Spotify, wait, transfer, retry) still applies unchanged.
+
+    The device NAME is used only for the hostname/"Web Player" comparisons above - never printed,
+    logged, or returned to the model, exactly like every other Spotify-supplied string in this
+    file. Only counts and booleans derived from it are ever logged."""
+    computers = [d for d in devices if d.get("type") == "Computer" and not d.get("is_restricted")]
+    hostname = socket.gethostname().strip().lower()
+    hostname_matches = [d for d in computers if str(d.get("name") or "").strip().lower() == hostname]
+    web_players = [d for d in computers if str(d.get("name") or "").strip().lower().startswith("web player")]
+    active_web_players = [d for d in web_players if d.get("is_active")]
+    print(
+        f"[spotify] device selection: computers={len(computers)} "
+        f"hostname_matched={bool(hostname_matches)} web_player_found={bool(web_players)}",
+        flush=True,
+    )
+
+    if not computers:
+        return None
+    if active_web_players:
+        return active_web_players[0].get("id")
+    if hostname_matches:
+        for device in hostname_matches:
+            if device.get("is_active"):
+                return device.get("id")
+        return hostname_matches[0].get("id")
+    active_computers = [d for d in computers if d.get("is_active")]
+    if len(active_computers) == 1:
+        return active_computers[0].get("id")
+    if len(web_players) == 1:
+        return web_players[0].get("id")
+    if len(computers) == 1:
+        return computers[0].get("id")
+    raise SpotifyError(
+        "I found more than one computer on your Spotify account and can't tell which one is this one."
+    )
+
+
+def _confirm_play_result(display):
+    """
+    (result_text, tainted=True). Called right after play_uri()'s PUT succeeds (200/204) - a
+    success status there is NOT proof anything is actually playing on this computer, only that
+    Spotify accepted the command. An idle device that was just woken up by transfer_playback can
+    take a moment to actually start, so this polls GET /me/player every
+    PLAY_VERIFY_POLL_INTERVAL_SECONDS, up to PLAY_VERIFY_MAX_POLLS times, and stops as soon as
+    is_playing is true - never waiting out the full budget once playback is confirmed.
+
+    Checks ONLY booleans/numbers - is_playing, the active device's TYPE, volume, whether an item
+    is loaded, the disallows count, and whether the device's name matches this machine's hostname
+    - never the name or id itself, which stay untrusted and unlogged here exactly as everywhere
+    else in this file.
+
+    Never raises: if the verification call itself fails, that is reported as "could not be
+    confirmed", not as an exception - a flaky read right after a real play must never turn into a
+    crashed /chat request over something this unimportant.
+    """
+    body = None
+    for _attempt in range(PLAY_VERIFY_MAX_POLLS):
+        time.sleep(PLAY_VERIFY_POLL_INTERVAL_SECONDS)
+        try:
+            _, body = _authed_call("GET", "/me/player")
+        except Exception as error:
+            print(f"[spotify] play verification call failed: {error}", flush=True)
+            return f"Spotify accepted the command to play {display}, but playback could not be confirmed.", True
+        if body and body.get("is_playing"):
+            break
+
+    is_playing = bool(body and body.get("is_playing"))
+    device = (body or {}).get("device") or {}
+    device_type = device.get("type")
+    volume_percent = device.get("volume_percent")
+    item_loaded = bool(body and body.get("item"))
+    disallows = ((body or {}).get("actions") or {}).get("disallows") or {}
+    disallow_count = sum(1 for value in disallows.values() if value)
+    hostname = socket.gethostname().strip().lower()
+    is_this_computer = device_type == "Computer" and str(device.get("name") or "").strip().lower() == hostname
+    print(
+        f"[spotify] play verification: is_playing={is_playing} device_type={device_type or 'none'} "
+        f"is_this_computer={is_this_computer} item_loaded={item_loaded} "
+        f"volume_percent={volume_percent if volume_percent is not None else 'none'} disallows={disallow_count}",
+        flush=True,
+    )
+
+    if is_playing and is_this_computer:
+        return f"Playing {display} on this computer.", True
+    if is_playing and device_type == "Computer":
+        # Could genuinely be the Web Player in HER OWN browser on this machine - its device name
+        # never equals the hostname, so this can't tell the difference and says so honestly
+        # instead of claiming "another device" when it might really be right here in the browser.
+        return (
+            f"Spotify accepted the command to play {display}, but it's playing on another computer "
+            "or in the browser.",
+            True,
+        )
+    if is_playing:
+        return f"Spotify accepted the command to play {display}, but it's playing on another device.", True
+    return (
+        f"Spotify accepted the command to play {display}, but it did not start on this computer. "
+        "Spotify might be in offline mode, or playback may have gone to another computer on this account.",
+        True,
+    )
+
+
 def transfer_playback(device_id, play=False):
     status, _ = _authed_call("PUT", "/me/player", json_body={"device_ids": [device_id], "play": play})
     if status not in (200, 204):
@@ -298,24 +430,38 @@ def _track_summary(item):
         "uri": item["uri"],
         "name": _clean_name(item.get("name")),
         "artist": _clean_name(", ".join(a.get("name", "") for a in item.get("artists", []))),
+        # None (field absent) means "unknown" - treated as playable, same as an explicit True.
+        # Only an explicit False means Spotify itself says this track can't be played for her.
+        "is_playable": item.get("is_playable"),
     }
 
 
 def search_tracks(query, limit=5):
-    status, body = _authed_call("GET", "/search", params={"q": query, "type": "track", "limit": limit})
+    # Dev Mode's own max is 10 - 5 is plenty for resolve_play's ambiguity check either way.
+    status, body = _authed_call(
+        "GET", "/search", params={"q": query, "type": "track", "limit": limit, "market": SPOTIFY_MARKET}
+    )
     if status != 200:
         raise SpotifyError(f"Spotify search failed (HTTP {status}).")
     items = ((body or {}).get("tracks") or {}).get("items") or []
-    return [_track_summary(t) for t in items]
+    results = [_track_summary(t) for t in items]
+    top_is_playable = results[0]["is_playable"] if results else None
+    print(
+        f"[spotify] search: results={len(results)} "
+        f"top_playable={'unknown' if top_is_playable is None else top_is_playable}",
+        flush=True,
+    )
+    return results
 
 
 def resolve_play(query):
     """
     {"uri", "display"} for the track to play, or {"ask": "..."} when the model should ask her
-    instead of guessing (no match, or the top two results share a name but not an artist).
-    Read-only (just a search) - safe to call even while an action is only being held, not done.
+    instead of guessing (no match, no PLAYABLE match, or the top two playable results share a
+    name but not an artist). Read-only (just a search) - safe to call even while an action is
+    only being held, not done.
     """
-    candidates = search_tracks(query)
+    candidates = [c for c in search_tracks(query) if c["is_playable"] is not False]
     if not candidates:
         return {"ask": f'No track found on Spotify for "{_clean_name(query, 120)}".'}
     if len(candidates) >= 2:
@@ -328,11 +474,56 @@ def resolve_play(query):
 
 
 def play_uri(uri, display):
-    """(result_text, tainted). tainted=True: `display` is a Spotify-supplied name."""
-    status, _ = _with_device_recovery(lambda: _authed_call("PUT", "/me/player/play", json_body={"uris": [uri]}))
+    """
+    (result_text, tainted). tainted=True: `display` is a Spotify-supplied name.
+
+    Plays on an explicit device when one can be confidently chosen (_choose_play_device_id) -
+    PUT .../play with no device_id lets Spotify pick ANY of her devices (phone, another
+    computer, ...), which is exactly how a "successful" 204 once silently started playback
+    somewhere she wasn't looking. _choose_play_device_id can raise SpotifyError itself when
+    there's more than one computer on the account and none matches this machine's hostname -
+    that propagates up unchanged, same as any other SpotifyError here.
+
+    An explicitly chosen device that is NOT currently active can just ignore a remote play
+    command (this really happened: a clean 204, but is_playing stayed false) - a desktop app
+    that's idle needs playback actually transferred to it first. So when the chosen device isn't
+    active, this transfers to it (without starting playback yet), waits
+    TRANSFER_BEFORE_PLAY_WAIT_SECONDS for it to wake up, then sends the play.
+
+    If the play itself still comes back 404 with an explicit device_id, the device may have gone
+    away between the lookup above and the play call - get_devices() is re-read, and if the chosen
+    device is still listed, this transfers to it once more and retries the play exactly once
+    before giving up with a clear message. The 404 "no active device at ALL" recovery
+    (_with_device_recovery: open Spotify, wait, transfer, retry) still applies unchanged.
+
+    The 200/204 itself is still only "Spotify accepted the command" - see _confirm_play_result
+    for the actual verification before this ever tells her it's playing.
+    """
+    devices = get_devices()
+    device_id = _choose_play_device_id(devices)
+    chosen_device_was_active = None
+    if device_id:
+        chosen_device_was_active = any(d.get("id") == device_id and d.get("is_active") for d in devices)
+        if not chosen_device_was_active:
+            transfer_playback(device_id, play=False)
+            time.sleep(TRANSFER_BEFORE_PLAY_WAIT_SECONDS)
+    print(
+        f"[spotify] play: {'explicit Computer device' if device_id else 'no explicit device'} "
+        f"chosen_device_was_active={chosen_device_was_active}",
+        flush=True,
+    )
+    params = {"device_id": device_id} if device_id else None
+
+    def _do_play():
+        return _authed_call("PUT", "/me/player/play", params=params, json_body={"uris": [uri]})
+
+    status, _ = _with_device_recovery(_do_play)
+    if status == 404 and device_id and any(d.get("id") == device_id for d in get_devices()):
+        transfer_playback(device_id)
+        status, _ = _do_play()
     if status not in (200, 204):
         raise SpotifyError(f"Could not start playback (HTTP {status}).")
-    return f"Playing {display}.", True
+    return _confirm_play_result(display)
 
 
 def pause():
