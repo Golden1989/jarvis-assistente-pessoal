@@ -160,6 +160,19 @@ def test_subject_aliases_case_and_accent_insensitive():
     assert jc.detect_save_summary_command("save summary REDE: x") == ("ok", "en", "networks", "x")
 
 
+def test_data_science_aliases_english_and_portuguese():
+    assert jc.detect_save_summary_command("save summary data science: pandas basics") == (
+        "ok", "en", "data science", "pandas basics")
+    assert jc.detect_save_summary_command("salvar resumo ciência de dados: pandas basics") == (
+        "ok", "pt", "data science", "pandas basics")
+    assert jc.detect_save_summary_command("salvar resumo ciencia dos dados: pandas basics") == (
+        "ok", "pt", "data science", "pandas basics")
+    assert jc.detect_add_topic_command("add topic datascience: overfitting") == (
+        "ok", "en", "data science", "overfitting")
+    assert jc.detect_add_topic_command("adicionar topico dados: overfitting") == (
+        "ok", "pt", "data science", "overfitting")
+
+
 def test_colon_inside_the_text_only_splits_on_the_first_one():
     parsed = jc.detect_save_summary_command("save summary forensics: note: timestamps matter most")
     assert parsed == ("ok", "en", "forensics", "note: timestamps matter most")
@@ -212,6 +225,14 @@ def test_study_material_reports_counts_and_last_added_date_never_contents():
     reply = jc.handle_study_material_command()
     assert "forensics: 2" in reply
     assert "a secret detail" not in reply and "another one" not in reply
+
+
+def test_study_material_counts_data_science():
+    work = tmp()
+    isolate(work)
+    jc._study_store.add("data science", "summary", "pandas groupby notes")
+    reply = jc.handle_study_material_command()
+    assert "data science: 1" in reply
 
 
 def test_study_material_empty_and_undo_empty_replies():
@@ -293,6 +314,14 @@ def test_only_one_entry_asks_three_questions_about_it():
 
 def test_no_entries_returns_empty():
     assert jc.select_quiz_entries([], "2026-01-11") == []
+
+
+def test_select_quiz_entries_can_choose_a_data_science_entry():
+    today = "2026-01-11"
+    entries = [make_study_entry(1, "data science", "2026-01-01")]
+    selected = jc.select_quiz_entries(entries, today)
+    assert len(selected) == jc.QUIZ_QUESTION_COUNT
+    assert all(e["subject"] == "data science" for e in selected)
 
 
 # ============================================================ the quiz flow itself (part B)
@@ -524,6 +553,23 @@ def test_quiz_summary_includes_neglect_nudge_for_cyber_and_networks():
         post_chat("a2")
         data = post_chat("a3").get_json()
     assert "cyber" in data["reply"] and "networks" in data["reply"]
+
+
+def test_quiz_summary_neglect_nudge_includes_data_science_when_empty():
+    work = tmp()
+    fresh_server(work, [
+        quiz_questions_response([(1, "Q1"), (1, "Q2"), (1, "Q3")]),
+        quiz_grade_response("correct"),
+        quiz_grade_response("correct"),
+        quiz_grade_response("correct"),
+    ])
+    seed_study_entries([make_study_entry(1, "forensics", "2020-01-01")])  # no data science entries at all
+    with quiet(io.StringIO()):
+        post_chat("quiz me")
+        post_chat("a1")
+        post_chat("a2")
+        data = post_chat("a3").get_json()
+    assert "data science" in data["reply"]
 
 
 # ============================================================ Spider-Man style rules / review

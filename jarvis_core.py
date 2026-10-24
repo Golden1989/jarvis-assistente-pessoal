@@ -52,11 +52,12 @@ BRIEFING_SPOKEN_MARKER = "---SPOKEN---"
 BRIEFING_FALLBACK_HEADLINES = 3  # how many lines to use as the spoken version if the model omits the marker
 
 # One line to add a subject: a canonical name here, plus its aliases below.
-STUDY_SUBJECTS = ["forensics", "cyber", "networks"]
+STUDY_SUBJECTS = ["forensics", "cyber", "networks", "data science"]
 STUDY_SUBJECT_ALIASES = {
     "forensics": {"forensics", "forense", "forenses"},
     "cyber": {"cyber", "cybersecurity", "ciber", "cibersegurança", "ciberseguranca"},
     "networks": {"networks", "redes", "rede"},
+    "data science": {"data science", "datascience", "ciencia de dados", "ciencia dos dados", "dados"},
 }
 QUIZ_QUESTION_COUNT = 3
 QUIZ_START_MAX_TOKENS = 3000
@@ -2678,7 +2679,7 @@ def current_quiz_question_text():
 def _neglected_subjects(today):
     counts = _study_store.counts_by_subject()
     neglected = []
-    for subject in ("cyber", "networks"):  # per the spec - "forensics" is not checked here
+    for subject in ("cyber", "networks", "data science"):  # per the spec - "forensics" is not checked here
         _, last_added = counts.get(subject, (0, None))
         if last_added is None or _days_between(last_added, today) >= STUDY_NEGLECT_DAYS:
             neglected.append(subject)
