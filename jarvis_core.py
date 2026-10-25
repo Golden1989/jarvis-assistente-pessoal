@@ -12,6 +12,7 @@ import shutil
 import threading
 import time
 import unicodedata
+import uuid
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -773,6 +774,9 @@ UNTRUSTED_CLIENT_TOOLS = {"read_file", "list_files", "look_at_screen", "list_cal
 UNTRUSTED_SERVER_BLOCKS = {"server_tool_use", "web_search_tool_result"}
 PENDING_MAX_AGE_SECONDS = 600
 PENDING_MAX_ITEMS = 5
+# Stage B (dashboard Confirm/Cancel buttons): the cap on what /status ever sends about one pending
+# item, regardless of how big a diff/track-name/etc. happens to be.
+PENDING_DISPLAY_MAX_CHARS = 2000
 # Held actions are held in the message that used untrusted content AND in
 # this many messages after it (an injection can wait for the next message).
 # 0 = only the same message.
@@ -1161,7 +1165,8 @@ class ActionGuard:
             return msg
         base_stamp = _notes_stamp() if tool == "update_notes" else None
         self.pending.append({"tool": tool, "input": item_input, "display": display_or_error,
-                             "base_stamp": base_stamp, "round": self.round, "at": time.monotonic()})
+                             "base_stamp": base_stamp, "round": self.round, "at": time.monotonic(),
+                             "id": uuid.uuid4().hex, "tainted": self.writes_held()})
         self._log(tool, "held", display_or_error)
         return ACTION_HOLD_MESSAGE
 
@@ -1198,12 +1203,64 @@ class ActionGuard:
             self._log(item["tool"], "refused", "cancelled by user")
         return len(discarded)
 
+    def confirm_one(self, item_id):
+        """Stage B (dashboard Confirm button): confirms exactly the one pending item with this id,
+        re-checking its age NOW (not just at hold time) regardless of which round it was held in -
+        a click can arrive long after the round that held it. Reuses _execute_pending(), the SAME
+        re-validation every spoken 'yes' already goes through, so a click and a typed 'yes' can
+        never behave differently. Deliberately does NOT check self.untrusted/_looks_like_yes: those
+        validate a spoken/typed 'yes' against the risk that injected content faked one - the
+        button's proof of intent (a same-origin, token-authenticated POST naming this one exact id)
+        is a different, already-stronger chain, not a weaker substitute.
+        Returns (tool_name, result_text) on success, or (None, refusal_text) if this id is not a
+        still-live pending item - it never falls back to "whatever happens to be pending"."""
+        now = time.monotonic()
+        match = next((i for i in self.pending
+                      if i["id"] == item_id and now - i["at"] < PENDING_MAX_AGE_SECONDS), None)
+        if match is None:
+            return None, ("Not confirmable: this item is no longer pending "
+                          "(already handled, cancelled, or expired).")
+        self.pending = [i for i in self.pending if i is not match]
+        result = self._execute_pending(match)
+        return match["tool"], result
+
+    def discard_one(self, item_id):
+        """Stage B (dashboard Cancel button): cancels exactly one pending item, no confirmation
+        needed - same idea as discard_pending() but scoped to one id. Returns the discarded item's
+        tool name, or None if this id was not pending (already handled/cancelled/expired)."""
+        for index, item in enumerate(self.pending):
+            if item["id"] == item_id:
+                del self.pending[index]
+                self._log(item["tool"], "refused", "cancelled by user (one item)")
+                return item["tool"]
+        return None
+
+    def pending_for_display(self):
+        """Every still-live pending item (any round, same age rule confirm_one/discard_one use),
+        for /status - unlike notice()'s per-round numbering, which is only for the chat reply text.
+        display is capped at PENDING_DISPLAY_MAX_CHARS regardless of how big the underlying diff/
+        preview actually is - this is page payload hygiene, unrelated to the tool-name+status-only
+        sanitization in _notice_status() below (the dashboard panel renders this via textContent,
+        never re-feeds it to the model)."""
+        now = time.monotonic()
+        out = []
+        for item in self.pending:
+            if now - item["at"] >= PENDING_MAX_AGE_SECONDS:
+                continue
+            display = item["display"]
+            if len(display) > PENDING_DISPLAY_MAX_CHARS:
+                display = display[:PENDING_DISPLAY_MAX_CHARS] + "... [truncated]"
+            out.append({"id": item["id"], "tool": item["tool"], "display": display,
+                       "tainted": item["tainted"]})
+        return out
+
     def notice(self):
         """Text the CALLER appends to the reply - written by code, not by the model."""
         mine = [i for i in self.pending if i["round"] == self.round]
         if not mine:
             return ""
-        lines = ['Pendente / Pending - NOT done yet (say "sim" / "yes" to do exactly this):']
+        lines = ['Pendente / Pending - NOT done yet (say "sim" / "yes", or use Confirm/Cancel on '
+                'the dashboard):']
         for n, item in enumerate(mine, 1):
             lines.append(f'{n}. {item["display"]}')
         return "\n".join(lines)
@@ -1228,6 +1285,79 @@ def cancel_pending_actions():
     """Discard any held action immediately, no API call. Used by the 'stop'/'cancel' command and
     the dashboard's /cancel. Returns True if there was something to cancel."""
     return _guard.discard_pending() > 0
+
+
+# --- Stage B: telling the model what a dashboard button did ----------------
+# A button click happens OUTSIDE any chat round. The model's own LAST STORED REPLY may still say
+# "Pendente - NOT done yet" (compose_reply() wrote that before she ever clicked), so a one-shot
+# addendum to the NEXT call's system prompt isn't enough - the model's own history already
+# contradicts it. Instead, web/server.py's /pending/confirm and /pending/cancel routes append a
+# real, persistent user+assistant pair to `messages` themselves, right after a successful
+# confirm_pending_by_id()/discard_pending_by_id() call, and ONLY when the last stored message is
+# an assistant message (if it isn't, nothing is appended - never guess where to insert it). That
+# pair is inserted BEFORE her next real message, so call_claude()'s
+# _guard.begin_round(_latest_user_text(messages)) - and therefore _looks_like_yes() - still only
+# ever sees her own literal next message, never this one. See confirm_pending_by_id/
+# discard_pending_by_id below for the note text itself, and web/server.py for where it's appended.
+#
+# Every failure-shaped prefix the _do_*/file_ops.py functions a held tool can reach actually use:
+# "Error"/"Not confirmable"/"Blocked" (file_ops.py, ActionGuard itself), "Failed to create
+# event"/"Failed to open app" (jarvis_core.py), "Spotify: {error}" (spotify_control.SpotifyError),
+# "Nothing to remember - empty note." (an empty remember somehow reaching execution), "Unknown
+# spotify action" (same defensive case), and "Could not"/"Cannot" generically for any such message
+# this list doesn't already name verbatim.
+_NOTICE_FAILURE_PREFIXES = ("Error", "Failed", "Not confirmable", "Blocked", "Spotify:",
+                           "Nothing to remember", "Unknown spotify action", "Could not", "Cannot")
+# Every success-shaped prefix those same functions actually use: create_file/edit_file/move_file
+# ("Created"/"Edited"/"Moved"), remember ("Saved under..."), update_notes ("Notes updated."),
+# create_calendar_event ("Event created: ..."), open_app ("Opened ..."), and spotify's own several
+# ("Playing"/"Spotify accepted the command to play"/"Paused"/"Resumed"/"Skipped"/"Back to the
+# previous track"/"Volume set to").
+_NOTICE_SUCCESS_PREFIXES = ("Created", "Edited", "Moved", "Saved", "Notes updated", "Event created",
+                           "Opened", "Playing", "Spotify accepted the command to play", "Paused",
+                           "Resumed", "Skipped", "Back to the previous track", "Volume set to")
+
+
+def _notice_status(result):
+    """'ok'/'failed'/'result not classified', checked ONLY against fixed prefixes this codebase's
+    own _do_*/file_ops.py functions actually use - never against any variable part of the message
+    (a file path, a Spotify track name, diff/document content...). That variable part is third-
+    party/tool output and must never ride along into the model's context - see
+    confirm_pending_by_id() below. Anything matching neither list is reported as 'result not
+    classified' rather than guessed as 'ok' - if a _do_* function's wording ever changes or a new
+    one is added, this fails loud (an unclassified status in the note) instead of silently calling
+    a failure "ok"."""
+    text = str(result)
+    if text.startswith(_NOTICE_FAILURE_PREFIXES):
+        return "failed"
+    if text.startswith(_NOTICE_SUCCESS_PREFIXES):
+        return "ok"
+    return "result not classified"
+
+
+def confirm_pending_by_id(item_id):
+    """web/server.py's /pending/confirm - the ONLY caller of _guard.confirm_one(). Returns
+    (tool_name, result_text, note) - note is the fixed-template, tool-name+status-only text (never
+    raw result text) for web/server.py to append to `messages` as a persistent history entry, or
+    None if there was nothing to confirm."""
+    tool, result = _guard.confirm_one(item_id)
+    note = f"Done: {tool} ({_notice_status(result)}) - confirmed via the dashboard, not by typing yes." \
+        if tool is not None else None
+    return tool, result, note
+
+
+def discard_pending_by_id(item_id):
+    """web/server.py's /pending/cancel - the ONLY caller of _guard.discard_one(). Returns (ok,
+    note) - ok is True if something was actually cancelled; note is the fixed-template text for
+    web/server.py to append to `messages`, or None if there was nothing to cancel."""
+    tool = _guard.discard_one(item_id)
+    note = f"Cancelled via the dashboard: {tool}." if tool is not None else None
+    return tool is not None, note
+
+
+def pending_actions_for_status():
+    """web/server.py's /status - the ONLY caller of _guard.pending_for_display()."""
+    return _guard.pending_for_display()
 
 
 def _mode_words(text):
@@ -1448,6 +1578,21 @@ def detect_undo_file_change_command(text):
     return bool(words) and " ".join(words) == UNDO_FILE_CHANGE_PHRASE
 
 
+def detect_undo_file_change_named_command(text):
+    """The filename following 'undo last file change ' (e.g. 'undo last file change notes.md'),
+    trimmed, original casing kept (matching is case-insensitive anyway - see
+    handle_undo_file_change_named_command) - or None if her message isn't that prefix followed by
+    something. English only, same precedent as UNDO_STUDY_PHRASE/STUDY_MATERIAL_PHRASE (no
+    Portuguese phrasing was specified for this feature). Unlike _parse_prefixed_entry_command,
+    there's no subject/colon to parse here - just a filename."""
+    stripped = (text or "").strip()
+    prefix = UNDO_FILE_CHANGE_PHRASE + " "
+    if not stripped.lower().startswith(prefix):
+        return None
+    filename = stripped[len(prefix):].strip()
+    return filename or None
+
+
 QUIZ_START_PHRASES = {"en": {"quiz me", "start quiz"}, "pt": {"iniciar perguntas"}}
 QUIZ_END_PHRASES = {"en": {"end quiz"}, "pt": {"encerrar perguntas"}}
 
@@ -1563,8 +1708,134 @@ def handle_undo_study_command():
     return NOTICES["study_undo_done"][lang].format(subject=removed["subject"], date=removed["added_date"])
 
 
+# "undo last file change" (bare) lists the last 5 recorded changes and waits ~2 minutes for her
+# very next message to name one (exact file name, case-insensitive) or say "undo N" - never a
+# bare number alone. "undo last file change <name>" acts immediately when the name is
+# unambiguous. Both are fixed, whole-message, NON-model commands - entirely separate from
+# ActionGuard/Stage B: this state can never be set or satisfied by the model or by injected file/
+# web content, only by her own literal next whole message, checked here in jarvis_core.py before
+# web/server.py's _chat() does anything else with that message.
+UNDO_CHOICE_TIMEOUT_SECONDS = 120   # ~2 minutes
+
+
+class _UndoChoiceState:
+    """Self-expiring: is_open() clears itself once UNDO_CHOICE_TIMEOUT_SECONDS has passed, so an
+    expired choice is never silently treated as still live."""
+
+    def __init__(self):
+        self.entries = None
+        self.at = None
+
+    def open(self, entries):
+        self.entries = list(entries)
+        self.at = time.monotonic()
+
+    def clear(self):
+        self.entries = None
+        self.at = None
+
+    def is_open(self):
+        if self.entries is None:
+            return False
+        if time.monotonic() - self.at >= UNDO_CHOICE_TIMEOUT_SECONDS:
+            self.clear()
+            return False
+        return True
+
+
+_undo_choice = _UndoChoiceState()
+
+
+def _format_age(seconds):
+    if seconds < 60:
+        return "less than a minute"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} hr {minutes % 60} min"
+
+
+def _format_undo_choice_list(entries, trailer):
+    lines = ["Recent file changes (nothing has changed yet):"]
+    now = time.time()
+    for n, entry in enumerate(entries, 1):
+        age = _format_age(now - entry["at"]) if entry.get("at") else "unknown time"
+        lines.append(f"{n}. {entry['action']} {entry['target_path']} ({age} ago)")
+    lines.append(trailer)
+    return "\n".join(lines)
+
+
+def _execute_named_undo(entry):
+    try:
+        return file_ops.undo_entry(_autonomy_scope, _undo_log, entry)
+    except autonomy_scope.ScopeError as error:
+        return f"Could not undo: {error}"
+
+
 def handle_undo_file_change_command():
-    return file_ops.undo_last_file_change(_autonomy_scope, _undo_log)
+    """Bare 'undo last file change' - lists the last 5, changes NOTHING, opens the ~2-minute
+    choice window. Asking again while a choice is already open just re-opens it fresh (the
+    top-level maybe_resolve_pending_file_undo_choice() check in web/server.py's _chat() clears any
+    stale choice before this ever runs, so there is never a duplicate)."""
+    entries = _undo_log.recent(5)
+    if not entries:
+        return "Nothing recorded to undo."
+    _undo_choice.open(entries)
+    return _format_undo_choice_list(
+        entries, 'Reply with the exact file name, or "undo N", to undo just that one - any '
+                 "other message cancels this without changing anything.")
+
+
+def handle_undo_file_change_named_command(filename):
+    """'undo last file change <name>' - acts immediately, no confirmation (she already named it),
+    when the name is unambiguous; lists and asks for a number when it matches more than one
+    recorded change; says so and changes nothing when it matches none. Searches EVERY recorded
+    entry, not just the last 5 the bare command shows."""
+    folded = _fold(filename.strip())
+    matches = [e for e in _undo_log.all_entries() if _fold(Path(e["target_path"]).name) == folded]
+    if not matches:
+        _undo_choice.clear()
+        return f"No recorded file change matches '{filename}'."
+    if len(matches) > 1:
+        _undo_choice.open(matches)
+        return _format_undo_choice_list(
+            matches, 'More than one matches that name - reply with the number ("undo N").')
+    _undo_choice.clear()
+    return _execute_named_undo(matches[0])
+
+
+def _resolve_by_name_or_number(text, entries):
+    """The one entry `text` names - an exact file name (case-insensitive) or the exact form
+    "undo N" (never a bare number alone) - against the CURRENTLY open list, or None if it names
+    none or more than one. Never guesses."""
+    folded = _fold((text or "").strip())
+    by_name = [e for e in entries if _fold(Path(e["target_path"]).name) == folded]
+    if len(by_name) == 1:
+        return by_name[0]
+    match = re.fullmatch(r"undo\s+(\d+)", folded)
+    if match:
+        n = int(match.group(1))
+        if 1 <= n <= len(entries):
+            return entries[n - 1]
+    return None
+
+
+def maybe_resolve_pending_file_undo_choice(user_input):
+    """Checked FIRST in web/server.py's _chat(), before every other command - her very next
+    message after the bare/named command's list either resolves it or clears it; nothing else
+    should ever see a stale choice still open. Returns None when there was nothing to resolve
+    (including: a quiz is active, in which case the state is cleared so it can never collide with
+    grading) - the caller then proceeds with its own normal handling of user_input, unchanged."""
+    if is_quiz_active():
+        _undo_choice.clear()
+        return None
+    if not _undo_choice.is_open():
+        return None
+    entry = _resolve_by_name_or_number(user_input, _undo_choice.entries)
+    _undo_choice.clear()   # always - "any other message clears the state", resolved or not
+    if entry is None:
+        return None
+    return _execute_named_undo(entry)
 
 
 def allow_more_today():

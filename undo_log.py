@@ -1,46 +1,34 @@
 """
-Jarvis's own record of file changes IT made (create/edit/move via file_ops.py), so "undo last file
-change" can reverse exactly one step. Lives OUTSIDE the repo and OUTSIDE OneDrive, in
-C:\\jarvis_workspace, and is itself hard-vetoed in jarvis_core.PROTECTED_PATHS - no tool Jarvis has,
-including its own file tools, may ever read, create, edit, or move undo_log.json or anything under
-backups\\.
+Jarvis's own record of file changes IT made (create/edit/move via file_ops.py) in THIS process run,
+so "undo last file change" can find and reverse one of them by name/number - see jarvis_core.py's
+_UndoChoiceState and file_ops.undo_entry.
 
-Same hardening shape as daily_spend.py/study_store.py/quiz_trigger.py (lazy load, a lock, atomic
-write, an injectable path, the JARVIS_TESTING refusal of the real file). A corrupt file only costs
-one unavailable undo, not her own data, so - like quiz_trigger.py, not study_store.py - it is warned
-about and reset rather than renamed aside.
+**In-memory only - never written to or read from disk.** Nothing about a file change survives a
+restart; only changes made in the current run are ever undoable. `UNDO_LOG_FILE`'s path constant
+stays defined and listed in jarvis_core.PROTECTED_PATHS purely defensively (in case a file from
+before this module stopped persisting is still sitting on disk, no tool should ever be able to
+touch it) - this module itself never opens it.
 
-Nothing here is ever trusted blindly. On LOAD, every entry is re-validated strictly: a recognized
-action type, every path absolute, an original_path present if and only if the action is "move," a
-backup_path (when present) that actually resolves inside backups_dir - never somewhere else - and a
-well-formed, lowercase sha256 hex digest - a malformed entry is dropped individually, loudly. The
-same backups_dir containment check guards every unlink too: a pruned entry's backup is only ever
-removed when it is confirmed to be inside backups_dir. At UNDO time
-(see file_ops.undo_last_file_change), the caller re-resolves every logged path through
-autonomy_scope.resolve(for_write=True) again and refuses unless the file's CURRENT sha256 still
-matches the hash recorded when that change was made - this module only stores and validates the
-log; it never touches the filesystem target itself.
+Pre-edit backups (`backups_dir`) are a SEPARATE, real recovery artifact and are unaffected by any
+of this: they are still written to disk on every edit and still pruned by count, same as always -
+only this log's own bookkeeping (which entry goes with which backup) is ephemeral.
 """
 import hashlib
-import json
 import os
-import re
 import threading
 import time
 from pathlib import Path
 
-UNDO_LOG_FILE = str(Path(r"C:\jarvis_workspace") / "undo_log.json")
+UNDO_LOG_FILE = str(Path(r"C:\jarvis_workspace") / "undo_log.json")   # kept only for PROTECTED_PATHS
 BACKUPS_DIR = str(Path(r"C:\jarvis_workspace") / "backups")
-UNDO_LOG_MAX_ITEMS = 20  # older entries are an audit trail only - just the newest is ever undoable
+UNDO_LOG_MAX_ITEMS = 20  # bounds memory/backups-dir growth, independent of disk persistence (there is none)
 ACTIONS = {"create", "edit", "move"}
-_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")   # lowercase only - sha256_of() never produces anything else
 
 
 def _is_within(base, target):
-    """normpath FIRST, then normcase - a raw string compare would let a backup_path like
-    "<backups_dir>\\..\\..\\x" pass just because it starts with backups_dir's own text; normpath
-    collapses the ".." segments (purely lexically - it never touches the filesystem, so this works
-    for a path that doesn't exist yet or ever) before the containment check runs."""
+    """normpath FIRST, then normcase - a raw string compare would let a path like
+    "<base>\\..\\..\\x" pass just because it starts with base's own text; normpath collapses the
+    ".." segments (purely lexically) before the containment check runs."""
     base_s = os.path.normcase(os.path.normpath(str(base)))
     target_s = os.path.normcase(os.path.normpath(str(target)))
     return target_s == base_s or target_s.startswith(base_s + os.sep)
@@ -55,104 +43,18 @@ def sha256_of(path):
 
 
 class UndoLog:
-    def __init__(self, path=None, backups_dir=None):
-        self._path = Path(path) if path is not None else Path(UNDO_LOG_FILE)
+    def __init__(self, backups_dir=None):
         self._backups_dir = Path(backups_dir) if backups_dir is not None else Path(BACKUPS_DIR)
         self._lock = threading.Lock()
-        self._loaded = False
         self._entries = []
         self._next_id = 1
 
-    def _refuse_if_untested_real_file(self):
-        """Same idea as spotify_control's/daily_spend's guard: if JARVIS_TESTING is set and this
-        instance still points at the real undo_log.json (no test gave it a temp `path`), refuse
-        instead of ever reading or writing the real file."""
-        if os.environ.get("JARVIS_TESTING") and str(self._path) == UNDO_LOG_FILE:
-            raise RuntimeError(
-                "JARVIS_TESTING is set and this UndoLog still points at the real undo_log.json - "
-                "a test must construct it with its own temp `path` first."
-            )
-
-    def _ensure_loaded(self):
-        if self._loaded:
-            return
-        self._refuse_if_untested_real_file()
-        self._load_from_disk()
-        self._loaded = True
-
-    def _load_from_disk(self):
-        data = None
-        if self._path.exists():
-            try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
-                if not isinstance(data, list):
-                    raise ValueError("undo_log.json is not a list")
-            except (OSError, ValueError) as error:
-                print(f"[undo_log] could not read {self._path.name} ({error}) - starting empty "
-                      "(the file on disk is left untouched, overwritten on the next successful "
-                      "change)", flush=True)
-                data = None
-        entries = []
-        for i, raw in enumerate(data or []):
-            entry = self._validate_entry(raw, i)
-            if entry is not None:
-                entries.append(entry)
-        self._entries = entries
-        self._next_id = max((e["id"] for e in entries), default=0) + 1
-
-    def _validate_entry(self, raw, index):
-        try:
-            if not isinstance(raw, dict):
-                raise ValueError("not an object")
-            entry_id = raw["id"]
-            if not isinstance(entry_id, int):
-                raise ValueError("id is not an int")
-            action = raw["action"]
-            if action not in ACTIONS:
-                raise ValueError(f"action {action!r} not recognized")
-            target_path = raw["target_path"]
-            original_path = raw.get("original_path")
-            backup_path = raw.get("backup_path")
-            post_hash = raw["post_hash"]
-            if not isinstance(target_path, str) or not os.path.isabs(target_path):
-                raise ValueError("target_path is not an absolute path")
-            if action == "move":
-                if not isinstance(original_path, str) or not os.path.isabs(original_path):
-                    raise ValueError("a move entry needs an absolute original_path")
-            elif original_path is not None:
-                raise ValueError(f"a {action} entry must not have an original_path")
-            if backup_path is not None:
-                if not isinstance(backup_path, str) or not os.path.isabs(backup_path):
-                    raise ValueError("backup_path is not an absolute path")
-                if not _is_within(self._backups_dir, Path(backup_path)):
-                    raise ValueError("backup_path is not inside backups_dir")
-            if not isinstance(post_hash, str) or not _SHA256_HEX_RE.fullmatch(post_hash):
-                raise ValueError("post_hash is not a 64-char lowercase sha256 hex digest")
-            return {"id": entry_id, "at": raw.get("at"), "action": action, "target_path": target_path,
-                    "original_path": original_path, "backup_path": backup_path, "post_hash": post_hash}
-        except (KeyError, ValueError, TypeError) as error:
-            print(f"[undo_log] entry #{index} is invalid ({error}) - dropped", flush=True)
-            return None
-
-    def _save(self):
-        tmp = self._path.with_name(self._path.name + ".tmp")
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(self._entries), encoding="utf-8")
-            os.replace(tmp, self._path)
-        except OSError as error:
-            print(f"[undo_log] could not save {self._path.name} ({error}) - keeping this "
-                  "session's log in memory only", flush=True)
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-
     def record(self, action, target_path, original_path=None, backup_path=None, post_hash=None):
         """Called right after a create/edit/move succeeds - bookkeeping only, never part of
-        deciding whether that change itself was allowed."""
+        deciding whether that change itself was allowed. Prunes past UNDO_LOG_MAX_ITEMS, removing
+        the pruned entries' backups too (only ever unlinking a backup confirmed to be inside
+        backups_dir)."""
         with self._lock:
-            self._ensure_loaded()
             entry = {"id": self._next_id, "at": time.time(), "action": action,
                      "target_path": str(target_path),
                      "original_path": str(original_path) if original_path else None,
@@ -167,24 +69,25 @@ class UndoLog:
                         Path(backup).unlink()
                     except OSError:
                         pass
-            self._save()
 
-    def last(self):
+    def all_entries(self):
+        """Every entry, newest first, as copies - the named-undo search can match something older
+        than the last 5."""
         with self._lock:
-            self._ensure_loaded()
-            return dict(self._entries[-1]) if self._entries else None
+            return [dict(e) for e in reversed(self._entries)]
 
-    def pop_last(self):
-        """Removes and returns the newest entry, or None. Called by the undo command AFTER it has
-        already reversed the change (or decided there is nothing to reverse) - see
-        file_ops.undo_last_file_change."""
+    def recent(self, n):
+        """The newest n entries, newest first, as copies - for the bare command's list."""
+        return self.all_entries()[:n]
+
+    def remove_entry(self, entry_id):
+        """Removes the entry with this id, wherever it sits in the list (not necessarily the
+        newest - she can undo any of the last 5, or an older named one) - called only after that
+        entry's undo has actually succeeded. Returns True if something was removed."""
         with self._lock:
-            self._ensure_loaded()
-            if not self._entries:
-                return None
-            entry = self._entries.pop()
-            self._save()
-            return entry
+            before = len(self._entries)
+            self._entries = [e for e in self._entries if e["id"] != entry_id]
+            return len(self._entries) != before
 
     def new_backup_path(self, original_name):
         """A unique path under backups_dir for a pre-image copy, named like _backup_notes's own

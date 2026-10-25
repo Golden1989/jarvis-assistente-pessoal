@@ -2,7 +2,8 @@
 Stage A of the file-autonomy feature: autonomy_scope.py (scope resolution, Windows path
 hardening, the deny-list, PROTECTED_PATHS enforcement), file_ops.py (list/read/create/edit/move,
 extraction, OneDrive placeholders, size caps), extract_worker.py's zip-bomb hardening, and
-undo_log.py (schema validation, hash-verified undo).
+undo_log.py's in-memory record/list/remove primitives (list/pick, hash-verified undo behavior
+itself lives in tests/test_file_undo.py, alongside the rest of the redesigned undo commands).
 
 Every test is offline and self-contained: no real Anthropic call, no real folder on the developer's
 machine, and no assumption about whether pypdf/python-docx/python-pptx happen to be installed in
@@ -29,7 +30,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from _helpers import (
-    R, SR, SU, T, TU, fresh_server, isolate, jc, post_chat, run_module_tests, write_autonomy_scope,
+    R, SR, SU, T, TU, al, fresh_server, isolate, jc, post_chat, run_module_tests, write_autonomy_scope,
+    write_whitelist,
 )
 
 import autonomy_scope as asc  # noqa: E402 - after _helpers, which puts the project root on sys.path
@@ -416,13 +418,13 @@ def test_create_file_prep_and_do_round_trip():
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "notes.md"
     ok, item_input, display = fo.prep_create_file(scope, {"path": str(target), "content": "hello"})
     assert ok and "create" in display
     assert fo.do_create_file(scope, undo, item_input) == f"Created {target.resolve()}."
     assert target.read_text(encoding="utf-8") == "hello"
-    assert undo.last()["action"] == "create"
+    assert undo.recent(1)[0]["action"] == "create"
 
 
 def test_create_file_refuses_if_target_already_exists():
@@ -470,7 +472,7 @@ def test_create_file_confirm_time_refuses_if_something_appeared_since_it_was_hel
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "notes.md"
     ok, item_input, _ = fo.prep_create_file(scope, {"path": str(target), "content": "hi"})
     assert ok
@@ -486,7 +488,7 @@ def test_edit_file_exact_replacement_round_trip_with_a_real_diff_and_a_backup():
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "notes.md"
     target.write_text("line one\nline two\nline three\n", encoding="utf-8")
     ok, item_input, display = fo.prep_edit_file(
@@ -494,7 +496,7 @@ def test_edit_file_exact_replacement_round_trip_with_a_real_diff_and_a_backup():
     assert ok and "+1/-1" in display
     assert fo.do_edit_file(scope, undo, item_input) == f"Edited {target.resolve()}."
     assert target.read_text(encoding="utf-8") == "line one\nline TWO\nline three\n"
-    entry = undo.last()
+    entry = undo.recent(1)[0]
     assert entry["action"] == "edit"
     assert Path(entry["backup_path"]).read_text(encoding="utf-8") == "line one\nline two\nline three\n"
 
@@ -521,7 +523,7 @@ def test_edit_file_refuses_at_confirm_time_when_old_text_no_longer_matches_once(
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "notes.md"
     target.write_text("line one\nline two\n", encoding="utf-8")
     ok, item_input, _ = fo.prep_edit_file(scope, {"path": str(target), "old_text": "line two", "new_text": "x"})
@@ -574,7 +576,7 @@ def test_edit_file_confirm_time_also_refuses_a_file_over_the_byte_cap():
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "big.md"
     target.write_text("hello world", encoding="utf-8")
     ok, item_input, _ = fo.prep_edit_file(scope, {"path": str(target), "old_text": "hello", "new_text": "hi"})
@@ -598,7 +600,7 @@ def test_edit_file_preserves_crlf_line_endings_exactly():
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "crlf.txt"
     target.write_bytes(b"line one\r\nline two\r\nline three\r\n")
     ok, item_input, _ = fo.prep_edit_file(
@@ -614,7 +616,7 @@ def test_move_file_round_trip_between_two_read_write_scopes():
     src_root, dst_root = tmp(), tmp()
     scope = _FakeScope([_scope_entry(src_root, mode="read_write"), _scope_entry(dst_root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     source = src_root / "notes.txt"
     source.write_text("hi", encoding="utf-8")
     dest = dst_root / "notes.txt"
@@ -622,7 +624,7 @@ def test_move_file_round_trip_between_two_read_write_scopes():
     assert ok
     assert "Moved" in fo.do_move_file(scope, undo, item_input)
     assert not source.exists() and dest.read_text(encoding="utf-8") == "hi"
-    entry = undo.last()
+    entry = undo.recent(1)[0]
     assert entry["action"] == "move" and entry["original_path"] == str(source.resolve())
 
 
@@ -863,162 +865,73 @@ def test_read_file_suggests_offset_not_page_when_more_chars_remain_in_the_same_w
     assert "page=31" not in result
 
 
-# ============================================================ undo_log.py: schema validation
+# ============================================================ undo_log.py: in-memory list/remove
 
-def test_undo_log_schema_validation_drops_every_malformed_entry_individually():
+def test_undo_log_recent_returns_newest_first_and_no_more_than_asked():
     work = tmp()
-    good_target = work / "f.txt"
-    good_target.write_text("x", encoding="utf-8")
-    good_hash = ul.sha256_of(good_target)
-    raw = [
-        {"id": 1, "action": "create", "target_path": str(good_target), "post_hash": good_hash},       # valid
-        {"id": 2, "action": "banana", "target_path": str(good_target), "post_hash": good_hash},        # bad action
-        {"id": 3, "action": "create", "target_path": "relative.txt", "post_hash": good_hash},          # not absolute
-        {"id": 4, "action": "create", "target_path": str(good_target), "original_path": "x",
-         "post_hash": good_hash},                                                      # create can't have original_path
-        {"id": 5, "action": "move", "target_path": str(good_target), "post_hash": good_hash},          # move needs one
-        {"id": 6, "action": "create", "target_path": str(good_target), "post_hash": "short"},          # bad hash
-        "not even a dict",
-    ]
-    path = work / "undo_log.json"
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    log = ul.UndoLog(path=path, backups_dir=work / "backups")
-    buf = io.StringIO()
-    with quiet(buf):
-        last = log.last()
-    assert last["id"] == 1
-    assert buf.getvalue().count("[undo_log]") == 6
-
-
-def test_undo_log_rejects_a_backup_path_outside_backups_dir():
-    work = tmp()
-    good_target = work / "f.txt"
-    good_target.write_text("x", encoding="utf-8")
-    good_hash = ul.sha256_of(good_target)
-    outside = tmp() / "not_a_backup.txt"
-    outside.write_text("sneaky", encoding="utf-8")
-    raw = [{"id": 1, "action": "edit", "target_path": str(good_target), "backup_path": str(outside),
-            "post_hash": good_hash}]
-    path = work / "undo_log.json"
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    log = ul.UndoLog(path=path, backups_dir=work / "backups")
-    buf = io.StringIO()
-    with quiet(buf):
-        last = log.last()
-    assert last is None
-    assert "[undo_log]" in buf.getvalue()
-    assert outside.exists()   # never touched just for failing validation
-
-
-def test_undo_log_rejects_a_backup_path_that_escapes_backups_dir_via_dot_dot():
-    """A raw-string/normcase-only compare would wrongly accept this: the string literally STARTS
-    WITH backups_dir's own text, even though ".." walks it right back out to the parent folder."""
-    work = tmp()
-    backups_dir = work / "backups"
-    backups_dir.mkdir()
-    good_target = work / "f.txt"
-    good_target.write_text("x", encoding="utf-8")
-    good_hash = ul.sha256_of(good_target)
-    outside = work / "escaped.txt"
-    outside.write_text("sneaky", encoding="utf-8")
-    escaping_path = str(backups_dir / ".." / "escaped.txt")
-    raw = [{"id": 1, "action": "edit", "target_path": str(good_target), "backup_path": escaping_path,
-            "post_hash": good_hash}]
-    path = work / "undo_log.json"
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    log = ul.UndoLog(path=path, backups_dir=backups_dir)
-    buf = io.StringIO()
-    with quiet(buf):
-        last = log.last()
-    assert last is None
-    assert "[undo_log]" in buf.getvalue()
-    assert outside.exists()
-
-
-def test_undo_log_rejects_uppercase_or_malformed_post_hash():
-    work = tmp()
-    good_target = work / "f.txt"
-    good_target.write_text("x", encoding="utf-8")
-    good_hash = ul.sha256_of(good_target)
-    raw = [
-        {"id": 1, "action": "create", "target_path": str(good_target), "post_hash": good_hash.upper()},
-        {"id": 2, "action": "create", "target_path": str(good_target), "post_hash": "g" * 64},
-    ]
-    path = work / "undo_log.json"
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    log = ul.UndoLog(path=path, backups_dir=work / "backups")
-    with quiet(io.StringIO()):
-        assert log.last() is None
-
-
-def test_undo_log_never_unlinks_a_pruned_backup_outside_backups_dir():
-    """Defense in depth for the pruning path itself - the public record()/load() paths can't
-    actually produce a backup_path outside backups_dir (new_backup_path() always stays inside it,
-    and _validate_entry refuses one on load), so this seeds one directly in memory to exercise the
-    unlink guard on its own."""
-    work = tmp()
-    log = ul.UndoLog(path=work / "undo_log.json", backups_dir=work / "backups")
-    outside = tmp() / "innocent.txt"
-    outside.write_text("do not delete me", encoding="utf-8")
-    with quiet(io.StringIO()):
-        log._ensure_loaded()
-    log._entries = [{"id": 1, "at": 0, "action": "create", "target_path": str(work / "x.txt"),
-                     "original_path": None, "backup_path": str(outside), "post_hash": "a" * 64}]
-    log._next_id = 2
-    target = work / "y.txt"
-    target.write_text("y", encoding="utf-8")
-    with mock.patch.object(ul, "UNDO_LOG_MAX_ITEMS", 1):
+    log = ul.UndoLog(backups_dir=work / "backups")
+    for i in range(3):
+        target = work / f"f{i}.txt"
+        target.write_text("x", encoding="utf-8")
         log.record("create", target, post_hash=ul.sha256_of(target))
-    assert outside.exists()
+    recent = log.recent(2)
+    assert [e["target_path"] for e in recent] == [str(work / "f2.txt"), str(work / "f1.txt")]
 
 
-def test_undo_log_never_unlinks_a_pruned_backup_that_escapes_via_dot_dot():
-    """Same ".." escape as the load-time test above, but exercised against the prune-time unlink
-    guard directly (seeded in memory - the public record()/load() paths can't produce this)."""
+def test_undo_log_all_entries_returns_everything_newest_first():
     work = tmp()
-    backups_dir = work / "backups"
-    backups_dir.mkdir()
-    log = ul.UndoLog(path=work / "undo_log.json", backups_dir=backups_dir)
-    outside = work / "escaped.txt"
-    outside.write_text("do not delete me", encoding="utf-8")
-    escaping_path = str(backups_dir / ".." / "escaped.txt")
-    with quiet(io.StringIO()):
-        log._ensure_loaded()
-    log._entries = [{"id": 1, "at": 0, "action": "create", "target_path": str(work / "x.txt"),
-                     "original_path": None, "backup_path": escaping_path, "post_hash": "a" * 64}]
-    log._next_id = 2
-    target = work / "y.txt"
-    target.write_text("y", encoding="utf-8")
-    with mock.patch.object(ul, "UNDO_LOG_MAX_ITEMS", 1):
+    log = ul.UndoLog(backups_dir=work / "backups")
+    for i in range(3):
+        target = work / f"f{i}.txt"
+        target.write_text("x", encoding="utf-8")
         log.record("create", target, post_hash=ul.sha256_of(target))
-    assert outside.exists()
+    assert [e["target_path"] for e in log.all_entries()] == [
+        str(work / "f2.txt"), str(work / "f1.txt"), str(work / "f0.txt")]
 
 
-def test_corrupt_undo_log_warns_and_resets_without_crashing():
+def test_undo_log_remove_entry_removes_only_the_named_id_regardless_of_position():
     work = tmp()
-    path = work / "undo_log.json"
-    path.write_text("{not a list", encoding="utf-8")
-    log = ul.UndoLog(path=path, backups_dir=work / "backups")
-    buf = io.StringIO()
-    with quiet(buf):
-        assert log.last() is None
-    assert "[undo_log]" in buf.getvalue()
+    log = ul.UndoLog(backups_dir=work / "backups")
+    ids = []
+    for i in range(3):
+        target = work / f"f{i}.txt"
+        target.write_text("x", encoding="utf-8")
+        log.record("create", target, post_hash=ul.sha256_of(target))
+        ids.append(log.all_entries()[0]["id"])
+    middle_id = ids[1]
+    assert log.remove_entry(middle_id) is True
+    remaining_ids = [e["id"] for e in log.all_entries()]
+    assert middle_id not in remaining_ids and len(remaining_ids) == 2
 
 
-def test_jarvis_testing_refuses_the_real_undo_log_file():
-    log = ul.UndoLog()   # no path override - points at the REAL C:\jarvis_workspace\undo_log.json
-    try:
-        log.last()
-        raise AssertionError("should have refused")
-    except RuntimeError as error:
-        assert "JARVIS_TESTING" in str(error)
+def test_undo_log_remove_entry_unknown_id_is_a_clean_no_op():
+    work = tmp()
+    log = ul.UndoLog(backups_dir=work / "backups")
+    target = work / "f.txt"
+    target.write_text("x", encoding="utf-8")
+    log.record("create", target, post_hash=ul.sha256_of(target))
+    assert log.remove_entry(999999) is False
+    assert len(log.all_entries()) == 1
+
+
+def test_undo_log_is_never_persisted_to_disk():
+    """In-memory only, by design - nothing about a file change survives a restart. A fresh
+    UndoLog + record()/recent() round trip must never create undo_log.json anywhere near it (the
+    temp work dir this test owns), unlike the old disk-backed version."""
+    work = tmp()
+    log = ul.UndoLog(backups_dir=work / "backups")
+    target = work / "f.txt"
+    target.write_text("x", encoding="utf-8")
+    log.record("create", target, post_hash=ul.sha256_of(target))
+    assert log.recent(1)[0]["action"] == "create"
+    assert not (work / "undo_log.json").exists()
 
 
 def test_old_backups_are_pruned_past_the_undo_log_item_cap():
     root = tmp()
     scope = _FakeScope([_scope_entry(root, mode="read_write")])
     log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
+    undo = ul.UndoLog(backups_dir=log_dir / "backups")
     target = root / "a.md"
     target.write_text("v0", encoding="utf-8")
     for i in range(ul.UNDO_LOG_MAX_ITEMS + 3):
@@ -1029,128 +942,9 @@ def test_old_backups_are_pruned_past_the_undo_log_item_cap():
     assert len(list((log_dir / "backups").iterdir())) <= ul.UNDO_LOG_MAX_ITEMS
 
 
-# ============================================================ "undo last file change" (undo_last_file_change)
-
-def test_undo_create_deletes_only_if_hash_still_matches():
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    target = root / "a.txt"
-    ok, item_input, _ = fo.prep_create_file(scope, {"path": str(target), "content": "hi"})
-    fo.do_create_file(scope, undo, item_input)
-    assert "Undone" in fo.undo_last_file_change(scope, undo)
-    assert not target.exists()
-    assert undo.last() is None
-
-
-def test_undo_create_refuses_and_does_not_pop_if_file_changed_since():
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    target = root / "a.txt"
-    ok, item_input, _ = fo.prep_create_file(scope, {"path": str(target), "content": "hi"})
-    fo.do_create_file(scope, undo, item_input)
-    target.write_text("someone edited me", encoding="utf-8")
-    result = fo.undo_last_file_change(scope, undo)
-    assert "changed since" in result and target.exists()
-    assert undo.last() is not None
-
-
-def test_undo_edit_restores_only_if_hash_still_matches():
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    target = root / "a.md"
-    target.write_text("before", encoding="utf-8")
-    ok, item_input, _ = fo.prep_edit_file(scope, {"path": str(target), "old_text": "before", "new_text": "after"})
-    fo.do_edit_file(scope, undo, item_input)
-    assert target.read_text(encoding="utf-8") == "after"
-    assert "Undone" in fo.undo_last_file_change(scope, undo)
-    assert target.read_text(encoding="utf-8") == "before"
-
-
-def test_undo_edit_refuses_if_file_changed_since_that_edit():
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    target = root / "a.md"
-    target.write_text("before", encoding="utf-8")
-    ok, item_input, _ = fo.prep_edit_file(scope, {"path": str(target), "old_text": "before", "new_text": "after"})
-    fo.do_edit_file(scope, undo, item_input)
-    target.write_text("something else", encoding="utf-8")
-    assert "changed since" in fo.undo_last_file_change(scope, undo)
-
-
-def test_undo_move_moves_back_only_if_hash_still_matches():
-    src_root, dst_root = tmp(), tmp()
-    scope = _FakeScope([_scope_entry(src_root, mode="read_write"), _scope_entry(dst_root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    source = src_root / "a.txt"
-    source.write_text("hi", encoding="utf-8")
-    dest = dst_root / "a.txt"
-    ok, item_input, _ = fo.prep_move_file(scope, {"path": str(source), "new_path": str(dest)})
-    fo.do_move_file(scope, undo, item_input)
-    assert "Undone" in fo.undo_last_file_change(scope, undo)
-    assert source.read_text(encoding="utf-8") == "hi" and not dest.exists()
-
-
-def test_undo_move_never_overwrites_the_original_path():
-    src_root, dst_root = tmp(), tmp()
-    scope = _FakeScope([_scope_entry(src_root, mode="read_write"), _scope_entry(dst_root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    source = src_root / "a.txt"
-    source.write_text("hi", encoding="utf-8")
-    dest = dst_root / "a.txt"
-    ok, item_input, _ = fo.prep_move_file(scope, {"path": str(source), "new_path": str(dest)})
-    fo.do_move_file(scope, undo, item_input)
-    source.write_text("something new is here now", encoding="utf-8")   # original path occupied again
-    result = fo.undo_last_file_change(scope, undo)
-    assert "already exists" in result
-    assert dest.exists()
-    assert source.read_text(encoding="utf-8") == "something new is here now"
-
-
-def test_undoing_twice_in_a_row_is_a_clean_no_op():
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    assert "Nothing to undo" in fo.undo_last_file_change(scope, undo)
-
-
-def test_repeated_undo_calls_walk_back_one_entry_at_a_time_each_hash_checked():
-    """"undo last file change" is whole-message and stateless: it always reverses only the entry
-    that is CURRENTLY newest. Saying it again after a successful undo reverses whatever is newest
-    NOW (one entry further back), each one independently hash-checked on its own - there is no
-    "undo everything" and no multi-step undo in one call."""
-    root = tmp()
-    scope = _FakeScope([_scope_entry(root, mode="read_write")])
-    log_dir = tmp()
-    undo = ul.UndoLog(path=log_dir / "undo_log.json", backups_dir=log_dir / "backups")
-    ok1, item1, _ = fo.prep_create_file(scope, {"path": str(root / "a.txt"), "content": "a"})
-    fo.do_create_file(scope, undo, item1)
-    ok2, item2, _ = fo.prep_create_file(scope, {"path": str(root / "b.txt"), "content": "b"})
-    fo.do_create_file(scope, undo, item2)
-    assert "Undone" in fo.undo_last_file_change(scope, undo)   # 1st call: undoes "b" only
-    assert not (root / "b.txt").exists()
-    assert (root / "a.txt").exists()
-    assert "Undone" in fo.undo_last_file_change(scope, undo)   # 2nd call: now undoes "a"
-    assert not (root / "a.txt").exists()
-
-
 # ============================================================ jarvis_core.py wiring / ActionGuard
-
-def test_detect_undo_file_change_command_whole_message_only():
-    assert jc.detect_undo_file_change_command("undo last file change") is True
-    assert jc.detect_undo_file_change_command("please undo last file change now") is False
-    assert jc.detect_undo_file_change_command("undo last study entry") is False
-
+# (file-undo behavior itself - detection, the choice state, undo_entry - now lives in
+# tests/test_file_undo.py, alongside the rest of the redesigned undo commands)
 
 def test_new_tool_schemas_have_the_expected_required_fields():
     tools = {t["name"]: t for t in jc.TOOLS}
@@ -1222,6 +1016,72 @@ def test_undo_last_file_change_command_via_chat_makes_no_api_call():
         r = post_chat("undo last file change").get_json()
     assert "nothing" in r["reply"].lower()
     assert cl.sent == []
+
+
+# ============================================================ test-helper safety nets
+# These simulate "isolate() was never called" by resetting just the one path attribute a moment
+# before calling the helper under test - never actually writing anything, since the guard must
+# raise BEFORE either helper's first write. The real attribute is restored immediately after,
+# inside a finally, so no later test in this file is affected.
+
+def test_write_autonomy_scope_refuses_the_real_config_file_path():
+    work = tmp()
+    isolate(work)
+    real_path = jc._autonomy_scope._path
+    jc._autonomy_scope._path = asc.CONFIG_FILE   # simulate a forgotten isolate() call
+    try:
+        try:
+            write_autonomy_scope([{"path": str(work), "mode": "read_write"}])
+            raise AssertionError("should have refused")
+        except RuntimeError as error:
+            assert "write_autonomy_scope" in str(error)
+    finally:
+        jc._autonomy_scope._path = real_path
+
+
+def test_write_autonomy_scope_refuses_a_path_outside_the_temp_directory():
+    work = tmp()
+    isolate(work)
+    real_path = jc._autonomy_scope._path
+    jc._autonomy_scope._path = Path(r"C:\not_a_real_temp_dir\autonomy_scope.json")
+    try:
+        try:
+            write_autonomy_scope([{"path": str(work), "mode": "read_write"}])
+            raise AssertionError("should have refused")
+        except RuntimeError:
+            pass
+    finally:
+        jc._autonomy_scope._path = real_path
+
+
+def test_write_whitelist_refuses_the_real_app_whitelist_path():
+    work = tmp()
+    isolate(work)
+    real_file = al.WHITELIST_FILE
+    al.WHITELIST_FILE = al._BASE_DIR / "app_whitelist.json"   # simulate a forgotten isolate() call
+    try:
+        try:
+            write_whitelist({})
+            raise AssertionError("should have refused")
+        except RuntimeError as error:
+            assert "write_whitelist" in str(error)
+    finally:
+        al.WHITELIST_FILE = real_file
+
+
+def test_write_whitelist_refuses_a_path_outside_the_temp_directory():
+    work = tmp()
+    isolate(work)
+    real_file = al.WHITELIST_FILE
+    al.WHITELIST_FILE = Path(r"C:\not_a_real_temp_dir\app_whitelist.json")
+    try:
+        try:
+            write_whitelist({})
+            raise AssertionError("should have refused")
+        except RuntimeError:
+            pass
+    finally:
+        al.WHITELIST_FILE = real_file
 
 
 if __name__ == "__main__":

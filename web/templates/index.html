@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="confirm-token" content="{{ confirm_token }}">
   <title>Jarvis</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='orb.css') }}">
@@ -43,6 +44,8 @@
     <button type="button" id="quiz-snooze-btn">Snooze 15 min</button>
     <button type="button" id="quiz-skip-btn">Skip today</button>
   </div>
+
+  <div class="pending-panel" id="pending-panel" hidden></div>
 
   <main class="dashboard">
     <aside class="col col-left">

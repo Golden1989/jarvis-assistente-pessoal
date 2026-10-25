@@ -11,6 +11,7 @@ run_tests.py` from the project root (see run_tests.py for why not pytest - it is
 import contextlib
 import os
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,11 +36,19 @@ import study_store as ss  # noqa: E402
 import quiz_trigger as qt  # noqa: E402
 import autonomy_scope as asc  # noqa: E402
 import undo_log as ul  # noqa: E402
-import server  # noqa: E402 - the Flask app; server.app.testing is set once, below
+import server  # noqa: E402 - the Flask app; server.app.testing/SERVER_NAME are set once, below
 
 import urllib.request  # noqa: E402 - identity-compared against sc._opener, see isolate() below
 
 server.app.testing = True
+# Test-only: Flask's own test client otherwise defaults to Werkzeug's generic "localhost" (no
+# port) as Host, which Stage B's Host check (web/server.py's _is_local_host/_is_local_request)
+# would then reject on every call that doesn't pass an explicit base_url. Setting this here, not
+# in server.py itself, keeps production behavior unchanged by anything test-only - Flask only
+# reads SERVER_NAME for url_for() outside a request context and for the session cookie domain,
+# neither of which this app relies on, so this has no effect on the tests it's about to make pass
+# either, beyond giving the test client the right default Host.
+server.app.config["SERVER_NAME"] = f"{server.HOST}:{server.PORT}"
 
 
 class NeverRealGoogle:
@@ -82,7 +91,8 @@ def isolate(tmp_path):
     # write_autonomy_scope below) - never the developer's real file or real jarvis_workspace.
     jc._autonomy_scope = asc.AutonomyScope(path=tmp_path / "autonomy_scope.json",
                                            protected_paths=jc.PROTECTED_PATHS, valid_subjects=jc.STUDY_SUBJECTS)
-    jc._undo_log = ul.UndoLog(path=tmp_path / "undo_log.json", backups_dir=tmp_path / "backups")
+    jc._undo_log = ul.UndoLog(backups_dir=tmp_path / "backups")  # in-memory log - fresh every test by construction
+    jc._undo_choice.clear()  # no dangling undo-choice state from a previous test leaks into this one
 
 
 class FakeClient:
@@ -151,6 +161,35 @@ def post_chat(message):
 
 def post_cancel():
     return server.app.test_client().post("/cancel")
+
+
+# Stage B: / and /status check Host only; /pending/confirm and /pending/cancel check Host AND
+# Origin (see web/server.py's _is_local_host/_is_local_request). `base_url` is how Werkzeug's test
+# client sets the Host header; passing it explicitly (rather than relying on its own default of
+# plain "localhost", with no port) is what makes these requests actually pass the real check, the
+# same way a real browser talking to http://127.0.0.1:5000 would.
+LOCAL_BASE_URL = f"http://{server.HOST}:{server.PORT}"
+LOCAL_ORIGIN = f"http://{server.HOST}:{server.PORT}"
+
+
+def get_index(base_url=LOCAL_BASE_URL):
+    return server.app.test_client().get("/", base_url=base_url)
+
+
+def get_status(base_url=LOCAL_BASE_URL):
+    return server.app.test_client().get("/status", base_url=base_url)
+
+
+def post_pending_confirm(item_id, token=None, base_url=LOCAL_BASE_URL, origin=LOCAL_ORIGIN):
+    headers = {"Origin": origin} if origin is not None else {}
+    body = {"id": item_id, "token": server.CONFIRM_TOKEN if token is None else token}
+    return server.app.test_client().post("/pending/confirm", base_url=base_url, headers=headers, json=body)
+
+
+def post_pending_cancel(item_id, token=None, base_url=LOCAL_BASE_URL, origin=LOCAL_ORIGIN):
+    headers = {"Origin": origin} if origin is not None else {}
+    body = {"id": item_id, "token": server.CONFIRM_TOKEN if token is None else token}
+    return server.app.test_client().post("/pending/cancel", base_url=base_url, headers=headers, json=body)
 
 
 def notes_text():
@@ -292,12 +331,33 @@ def fake_google_ok(link="https://example.invalid/fake-event"):
         events=lambda: SimpleNamespace(insert=lambda **kw: SimpleNamespace(execute=lambda: {"htmlLink": link})))
 
 
+def _refuse_unless_temp_path(path, label, real_path=None):
+    """Hard stop for a test helper that's about to write a real state file - belt-and-suspenders
+    alongside "every test calls isolate()/fresh_server() first": refuses (raises RuntimeError,
+    never silently no-ops) if `path` is literally the known real default (`real_path`, when
+    given) OR isn't inside the OS temp directory, where every tmp()/tempfile.mkdtemp() result in
+    this suite lives. A test that forgets isolate() then fails loudly here instead of silently
+    corrupting a real file on the developer's machine - exactly the incident this guards against."""
+    resolved = Path(path).resolve()
+    if real_path is not None and resolved == Path(real_path).resolve():
+        raise RuntimeError(f"{label}: refusing to write the REAL {resolved} - "
+                           "call isolate()/fresh_server() first.")
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved.relative_to(temp_root)
+    except ValueError:
+        raise RuntimeError(f"{label}: refusing to write {resolved} - it is not inside a temp "
+                           f"directory ({temp_root}); call isolate()/fresh_server() first.")
+
+
 def write_whitelist(entries):
     """Writes `entries` as app_whitelist.json at al.WHITELIST_FILE (a temp path - see isolate())
     and reloads app_launcher's cache. A fake, never-real exe path is created for every "exe" entry
     that doesn't already point at a file that exists, so app_launcher's own is_file() check passes
     without ever touching a real installed program."""
     import json
+    _refuse_unless_temp_path(al.WHITELIST_FILE, "write_whitelist",
+                             real_path=al._BASE_DIR / "app_whitelist.json")
     for entry in entries.values():
         if entry.get("type") == "exe" and not Path(entry["path"]).exists():
             Path(entry["path"]).parent.mkdir(parents=True, exist_ok=True)
@@ -325,8 +385,13 @@ def write_autonomy_scope(folders):
     """Writes `folders` (a list of dicts: "path", "mode", and optionally "subject"/
     "allowed_extensions") as autonomy_scope.json at jc._autonomy_scope's own (temp - see isolate())
     path, creating each folder on disk first if it doesn't exist yet (AutonomyScope refuses an
-    entry whose path isn't a real, existing directory). Call AFTER isolate()."""
+    entry whose path isn't a real, existing directory). Call AFTER isolate() - enforced below,
+    not just documented: AutonomyScope has no JARVIS_TESTING guard of its own (jarvis_core.py's
+    TOOLS list calls .describe() at import time, before any test's isolate() has run, so a
+    class-level guard would break every import), so this helper is the one thing standing between
+    a forgotten isolate() call and overwriting the real autonomy_scope.json."""
     import json
+    _refuse_unless_temp_path(jc._autonomy_scope._path, "write_autonomy_scope", real_path=asc.CONFIG_FILE)
     payload = {"folders": []}
     for entry in folders:
         path = Path(entry["path"])

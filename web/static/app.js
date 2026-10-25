@@ -25,7 +25,13 @@ const dailySpendEl = document.getElementById("daily-spend");
 const quizBanner = document.getElementById("quiz-banner");
 const quizSnoozeBtn = document.getElementById("quiz-snooze-btn");
 const quizSkipBtn = document.getElementById("quiz-skip-btn");
+const pendingPanel = document.getElementById("pending-panel");
 const DEFAULT_TAGLINE = brandTagline.textContent;
+
+// Stage B: embedded by the server (web/server.py's index()), regenerated every server start -
+// required on every /pending/confirm and /pending/cancel request.
+const metaTag = document.querySelector('meta[name="confirm-token"]');
+const CONFIRM_TOKEN = metaTag ? metaTag.content : "";
 
 // Called from desktop.py (evaluate_js) before it decides whether to pop this window forward for
 // the 16:00 quiz signal - true means "don't move the window, she's mid-typing". Defined here (the
@@ -296,6 +302,73 @@ function quizSnoozeOrSkip(path) {
 quizSnoozeBtn.addEventListener("click", quizSnoozeOrSkip("/quiz/snooze"));
 quizSkipBtn.addEventListener("click", quizSnoozeOrSkip("/quiz/skip"));
 
+// ---------- Pending actions (Stage B: Confirm/Cancel buttons) ----------
+// Everything below is rendered with textContent only, never innerHTML - a pending item's "display"
+// text can contain a file path, a diff, or other content the model read, and must never be parsed
+// as HTML. The server is the only thing that can actually execute or discard an item (by exact id,
+// re-validated at that moment) - these buttons just ask it to.
+
+async function pendingAction(path, id, actionsEl) {
+  actionsEl.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, token: CONFIRM_TOKEN }),
+    });
+    if (!res.ok) {
+      addLog("system", `${path} failed - try reloading the page if the server restarted.`);
+      return;
+    }
+    const data = await res.json();
+    addLog("system", data.message || (data.ok ? "Done." : "No longer possible - it may already have been handled or expired."));
+  } catch (error) {
+    addLog("system", `${path} failed: ${error}`);
+  } finally {
+    refreshStatus();
+  }
+}
+
+function renderPending(items) {
+  pendingPanel.innerHTML = "";
+  (items || []).forEach((item) => {
+    const box = document.createElement("div");
+    box.className = "pending-item";
+
+    const tool = document.createElement("div");
+    tool.className = "pending-item-tool";
+    tool.textContent = item.tool;
+    box.appendChild(tool);
+
+    if (item.tainted) {
+      const warning = document.createElement("div");
+      warning.className = "pending-item-warning";
+      warning.textContent = "Proposed after reading outside content - check carefully.";
+      box.appendChild(warning);
+    }
+
+    const pre = document.createElement("pre");
+    pre.textContent = item.display;
+    box.appendChild(pre);
+
+    const actions = document.createElement("div");
+    actions.className = "pending-item-actions";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.textContent = "Confirm";
+    confirmBtn.addEventListener("click", () => pendingAction("/pending/confirm", item.id, actions));
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", () => pendingAction("/pending/cancel", item.id, actions));
+    actions.append(confirmBtn, cancelBtn);
+    box.appendChild(actions);
+
+    pendingPanel.appendChild(box);
+  });
+  pendingPanel.hidden = !items || items.length === 0;
+}
+
 function looksPortuguese(text) {
   return /[ãõçáéíóúâêô]/i.test(text) || /\b(você|não|está|para|isso|então)\b/i.test(text);
 }
@@ -347,6 +420,7 @@ async function refreshStatus({ quiet = false } = {}) {
     renderCalendar(data.next_event);
     renderWakeHealth(data.wake_word);
     quizBanner.hidden = !data.quiz_due;
+    renderPending(data.pending);
   } catch (error) {
     if (!quiet) addLog("system", `status check failed: ${error}`);
   } finally {

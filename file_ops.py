@@ -382,51 +382,45 @@ def do_move_file(scope, undo, item_input):
     return f"Moved {source.path} -> {dest.path}."
 
 
-# --- "undo last file change" - a fixed, whole-message, NON-model command (see jarvis_core.py) -----
+# --- undo - called only from jarvis_core.py's fixed, whole-message, NON-model undo commands ------
 
-def undo_last_file_change(scope, undo):
-    """Reverses ONLY the single most recent create/edit/move still in the log - never trusting it
-    blindly: every path is re-resolved through scope.resolve(for_write=True) again, and the
-    target's CURRENT sha256 must still match what was recorded when that change was made,
-    otherwise this refuses and says why instead of reversing something that changed since. Her
-    "undo last file change" command is whole-message and stateless: saying it AGAIN after a
-    successful undo pops and reverses the entry that is now newest, walking back one entry at a
-    time, each one re-hash-checked on its own - there is no "undo everything" or "redo"."""
-    entry = undo.last()
-    if entry is None:
-        return "Nothing to undo - no file changes recorded."
-    try:
-        if entry["action"] == "create":
-            target = scope.resolve(entry["target_path"], for_write=True)
-            if not target.path.exists():
-                undo.pop_last()
-                return f"Nothing to undo - {target.path} is already gone."
-            if undo_log.sha256_of(target.path) != entry["post_hash"]:
-                return f"Could not undo: {target.path} changed since it was created - nothing was removed."
-            target.path.unlink()
-            undo.pop_last()
-            return f"Undone: removed {target.path} (it was just created)."
+def undo_entry(scope, undo, entry):
+    """Reverses exactly the given log entry (chosen by name/number in jarvis_core.py - not
+    necessarily the newest) - never trusting it blindly: every path is re-resolved through
+    scope.resolve(for_write=True) again, and the target's CURRENT sha256 must still match what was
+    recorded when that change was made, otherwise this refuses and says why instead of reversing
+    something that changed since. On success, removes exactly this entry from the log
+    (undo.remove_entry) - on any refusal, the entry is left in place for a possible later retry."""
+    if entry["action"] == "create":
+        target = scope.resolve(entry["target_path"], for_write=True)
+        if not target.path.exists():
+            undo.remove_entry(entry["id"])
+            return f"Nothing to undo - {target.path} is already gone."
+        if undo_log.sha256_of(target.path) != entry["post_hash"]:
+            return f"Could not undo: {target.path} changed since it was created - nothing was removed."
+        target.path.unlink()
+        undo.remove_entry(entry["id"])
+        return f"Undone: removed {target.path} (it was just created)."
 
-        if entry["action"] == "edit":
-            target = scope.resolve(entry["target_path"], for_write=True)
-            if not target.path.exists() or undo_log.sha256_of(target.path) != entry["post_hash"]:
-                return f"Could not undo: {target.path} changed since that edit - nothing was restored."
-            if not entry["backup_path"] or not Path(entry["backup_path"]).is_file():
-                return "Could not undo: the backup for that edit is missing."
-            shutil.copyfile(entry["backup_path"], target.path)
-            undo.pop_last()
-            return f"Undone: restored {target.path} to before that edit."
+    if entry["action"] == "edit":
+        target = scope.resolve(entry["target_path"], for_write=True)
+        if not target.path.exists() or undo_log.sha256_of(target.path) != entry["post_hash"]:
+            return f"Could not undo: {target.path} changed since that edit - nothing was restored."
+        if not entry["backup_path"] or not Path(entry["backup_path"]).is_file():
+            return "Could not undo: the backup for that edit is missing."
+        shutil.copyfile(entry["backup_path"], target.path)
+        undo.remove_entry(entry["id"])
+        return f"Undone: restored {target.path} to before that edit."
 
-        if entry["action"] == "move":
-            new_target = scope.resolve(entry["target_path"], for_write=True)
-            old_target = scope.resolve(entry["original_path"], for_write=True)
-            if not new_target.path.exists() or undo_log.sha256_of(new_target.path) != entry["post_hash"]:
-                return f"Could not undo: {new_target.path} changed since that move - nothing was moved back."
-            if old_target.path.exists():
-                return f"Could not undo: something already exists at {old_target.path} - nothing was moved."
-            shutil.move(str(new_target.path), str(old_target.path))
-            undo.pop_last()
-            return f"Undone: moved {old_target.path} back from {new_target.path}."
-    except autonomy_scope.ScopeError as error:
-        return f"Could not undo: {error}"
+    if entry["action"] == "move":
+        new_target = scope.resolve(entry["target_path"], for_write=True)
+        old_target = scope.resolve(entry["original_path"], for_write=True)
+        if not new_target.path.exists() or undo_log.sha256_of(new_target.path) != entry["post_hash"]:
+            return f"Could not undo: {new_target.path} changed since that move - nothing was moved back."
+        if old_target.path.exists():
+            return f"Could not undo: something already exists at {old_target.path} - nothing was moved."
+        shutil.move(str(new_target.path), str(old_target.path))
+        undo.remove_entry(entry["id"])
+        return f"Undone: moved {old_target.path} back from {new_target.path}."
+
     return "Could not undo: unrecognized action in the log."

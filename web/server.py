@@ -7,6 +7,8 @@ and the conversation lives in memory in one shared list - fine for one
 person talking to their own assistant on their own machine.
 """
 
+import hmac
+import secrets
 import sys
 import threading
 import webbrowser
@@ -17,32 +19,61 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import anthropic
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request
 
 import google_calendar
 import wake_health
+from server_config import HOST, PORT
 from jarvis_core import (
     FALLBACK_MODE, NOTICES, QUIZ_SNOOZE_MINUTES, SERIOUS_IDLE_MINUTES, TOOLS,
     BriefingFailedError, CallInfo, DailyLimitError, ModeState, ModelRefusedError, NoBriefingDataError,
     QuizFailedError, QuizNoMaterialError, QuizReviewLimitError, SystemPromptProvider, allow_more_reply,
     allow_more_today, briefing_failed_reply, briefing_unavailable_reply, call_claude,
-    cancel_pending_actions, check_and_signal_quiz, compose_reply, daily_limit_reply, daily_spend_status,
-    detect_add_topic_command, detect_allow_more_command, detect_briefing_command, detect_mode_command,
-    detect_quiz_end_command, detect_quiz_review_command, detect_quiz_skip_command, detect_quiz_snooze_command,
-    detect_quiz_start_command, detect_save_summary_command, detect_stop_command, detect_study_material_command,
-    detect_undo_file_change_command, detect_undo_study_command, end_quiz_command, get_or_run_briefing,
-    grade_quiz_answer, handle_save_entry_command, handle_study_material_command,
-    handle_undo_file_change_command, handle_undo_study_command, is_quiz_active,
-    message_language, mode_reply, quiz_already_active_reply, quiz_bad_response_reply, quiz_due_status,
-    quiz_limit_hit_reply, quiz_no_material_reply, quiz_review_limit_reply, refusal_reply,
-    review_quiz_question, skip_quiz_reply, skip_quiz_today, snooze_quiz, snooze_quiz_reply, start_quiz,
-    stop_reply,
+    cancel_pending_actions, check_and_signal_quiz, compose_reply, confirm_pending_by_id,
+    daily_limit_reply, daily_spend_status, detect_add_topic_command, detect_allow_more_command,
+    detect_briefing_command, detect_mode_command, detect_quiz_end_command, detect_quiz_review_command,
+    detect_quiz_skip_command, detect_quiz_snooze_command, detect_quiz_start_command,
+    detect_save_summary_command, detect_stop_command, detect_study_material_command,
+    detect_undo_file_change_command, detect_undo_file_change_named_command, detect_undo_study_command,
+    discard_pending_by_id, end_quiz_command, get_or_run_briefing, grade_quiz_answer,
+    handle_save_entry_command, handle_study_material_command, handle_undo_file_change_command,
+    handle_undo_file_change_named_command, handle_undo_study_command, is_quiz_active,
+    maybe_resolve_pending_file_undo_choice, message_language, mode_reply, pending_actions_for_status,
+    quiz_already_active_reply, quiz_bad_response_reply, quiz_due_status, quiz_limit_hit_reply,
+    quiz_no_material_reply, quiz_review_limit_reply, refusal_reply, review_quiz_question,
+    skip_quiz_reply, skip_quiz_today, snooze_quiz, snooze_quiz_reply, start_quiz, stop_reply,
 )
 
 app = Flask(__name__)
 
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment - never sent to the browser
 prompts = SystemPromptProvider()  # notes.txt is re-checked on every request
+
+# Stage B: a per-process token the dashboard must echo back on /pending/confirm and
+# /pending/cancel - regenerated every server start (this line runs once per process), never
+# persisted or logged. "Per-session" has no meaning beyond "per-process" here: the whole app is
+# already one single global session (`messages`, `mode_state`, `_guard` are each one unguarded
+# module instance), not a multi-browser-tab system.
+CONFIRM_TOKEN = secrets.token_urlsafe(32)
+
+# Host-only allowlist (checked on GET / and GET /status, which now carry the token and pending
+# previews) and the stricter Host-AND-Origin allowlist (checked on the state-changing POST routes).
+# Threat model for the Host check: not header spoofing (a browser sets Host to the real
+# destination, not an attacker-chosen value) but DNS rebinding - a page on an attacker's domain
+# gets that domain re-pointed at 127.0.0.1 after load, so a same-origin request from that page
+# lands on this server while Host still reads the attacker's domain name. Origin is the separate,
+# CSRF-style defense for POSTs, and is often simply absent on a plain GET navigation - so GET
+# routes check Host only, POST routes require Host AND a matching Origin.
+_LOCAL_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
+_LOCAL_ORIGINS = {f"http://{HOST}:{PORT}", f"http://localhost:{PORT}"}
+
+
+def _is_local_host(req):
+    return req.headers.get("Host", "") in _LOCAL_HOSTS
+
+
+def _is_local_request(req):
+    return _is_local_host(req) and req.headers.get("Origin") in _LOCAL_ORIGINS
 
 messages = []  # the conversation history, shared by every request (single user)
 mode_state = ModeState()  # mode, idle timer and per-model cost: shared by the dashboard and the voice widget
@@ -72,7 +103,9 @@ def _payload(reply, **extra):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    if not _is_local_host(request):
+        abort(403)
+    return render_template("index.html", confirm_token=CONFIRM_TOKEN)
 
 
 @app.route("/widget")
@@ -83,6 +116,8 @@ def widget():
 
 @app.route("/status")
 def status():
+    if not _is_local_host(request):
+        abort(403)
     # Calendar is best-effort: a dashboard glitch here shouldn't break the page.
     try:
         upcoming = google_calendar.next_event()
@@ -104,6 +139,7 @@ def status():
             "next_event": upcoming,
             "wake_word": wake_health.snapshot(),
             "quiz_due": quiz_due_status(),
+            "pending": pending_actions_for_status(),
         }
     )
 
@@ -143,6 +179,64 @@ def cancel():
     return jsonify({"had_pending": had_pending})
 
 
+def _confirm_token_ok(body):
+    return hmac.compare_digest(str(body.get("token", "")), CONFIRM_TOKEN)
+
+
+def _append_dashboard_note_to_history(note):
+    """The model's own last stored reply may still say 'Pendente - NOT done yet' (it was written
+    before she ever clicked) - a one-shot system-prompt aside can't fix that, so this appends a
+    real, persistent user+assistant pair to `messages` instead, right after a successful dashboard
+    confirm/cancel. ONLY when the last stored message is an assistant message - if it isn't
+    (nothing pending was ever actually held through a model round, or some other edge case),
+    nothing is appended, rather than guessing where it belongs. Inserted BEFORE her next real
+    message, so call_claude()'s _latest_user_text(messages)/_looks_like_yes() still only ever see
+    her own literal next message - never this pair. Plain dicts: _block_get() already handles
+    both SDK objects and dicts, the same shape tool-result blocks already use elsewhere."""
+    if note is None or not messages or messages[-1]["role"] != "assistant":
+        return
+    messages.append({"role": "user",
+                     "content": "[System note: she used a dashboard button, not a chat message]"})
+    messages.append({"role": "assistant", "content": [{"type": "text", "text": note}]})
+
+
+@app.route("/pending/confirm", methods=["POST"])
+def pending_confirm():
+    """Dashboard Confirm button for ONE pending item, named by id - never 'confirm whatever is
+    pending'. POST only (no route is registered for GET, so there is no state-changing GET path).
+    request.get_json(silent=True) never raises on a missing/malformed body - a garbled request
+    just gets ok:false/403 instead of a 500. Same chat_lock as /chat/cancel, so a click can't race
+    a half-finished chat round."""
+    if not _is_local_request(request):
+        abort(403)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    if not _confirm_token_ok(body):
+        abort(403)
+    with chat_lock:
+        tool, result, note = confirm_pending_by_id(str(body.get("id", "")))
+        _append_dashboard_note_to_history(note)
+    return jsonify({"ok": tool is not None, "message": result})
+
+
+@app.route("/pending/cancel", methods=["POST"])
+def pending_cancel():
+    """Dashboard Cancel button for ONE pending item, named by id. Same checks/locking as
+    /pending/confirm above."""
+    if not _is_local_request(request):
+        abort(403)
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        body = {}
+    if not _confirm_token_ok(body):
+        abort(403)
+    with chat_lock:
+        removed, note = discard_pending_by_id(str(body.get("id", "")))
+        _append_dashboard_note_to_history(note)
+    return jsonify({"ok": removed})
+
+
 @app.route("/quiz/snooze", methods=["POST"])
 def quiz_snooze():
     """Dashboard 'Snooze 15 min' button - same protection as /cancel: chat_lock, no API call,
@@ -162,6 +256,15 @@ def quiz_skip():
 
 
 def _chat(user_input):
+    # Her very next whole message after "undo last file change" opened a choice (the bare list,
+    # or a named command's disambiguation list) either resolves it or clears it - checked FIRST,
+    # before anything else, so no other command/quiz-answer handling below can ever see a stale
+    # choice still open. Returns None when there was nothing to resolve, in which case user_input
+    # falls through to be handled completely normally, exactly as if nothing had been open.
+    undo_choice_result = maybe_resolve_pending_file_undo_choice(user_input)
+    if undo_choice_result is not None:
+        return jsonify(_payload(undo_choice_result, fixed=True))
+
     lang = message_language(user_input)
 
     # Mode commands: her own words only, BEFORE anything is appended to the
@@ -224,6 +327,9 @@ def _chat(user_input):
         return jsonify(_payload(handle_study_material_command(), fixed=True))
     if detect_undo_study_command(user_input):
         return jsonify(_payload(handle_undo_study_command(), fixed=True))
+    named_undo_filename = detect_undo_file_change_named_command(user_input)
+    if named_undo_filename is not None:
+        return jsonify(_payload(handle_undo_file_change_named_command(named_undo_filename), fixed=True))
     if detect_undo_file_change_command(user_input):
         return jsonify(_payload(handle_undo_file_change_command(), fixed=True))
 
@@ -336,8 +442,8 @@ def _chat(user_input):
 
 
 if __name__ == "__main__":
-    webbrowser.open("http://127.0.0.1:5000")
+    webbrowser.open(f"http://{HOST}:{PORT}")
     # host=127.0.0.1: reachable only from this machine, never your local network.
     # debug=False: the Flask debugger can execute arbitrary code - never turn
     # it on for anything that touches a real API key or your files/calendar.
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=HOST, port=PORT, debug=False)

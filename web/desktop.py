@@ -35,9 +35,10 @@ import voice_capture
 import wake_word
 from quiz_signal import quiz_signal_action
 from server import app
+from server_config import HOST, PORT
 from jarvis_core import REPLY_LANGUAGE, detect_stop_command
 
-SERVER_URL = "http://127.0.0.1:5000"
+SERVER_URL = f"http://{HOST}:{PORT}"
 
 WIDGET_SIZE = 160
 DASHBOARD_WIDTH = 980
@@ -100,7 +101,7 @@ def _widget_position():
 
 
 def _run_server():
-    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    app.run(host=HOST, port=PORT, debug=False, use_reloader=False)
 
 
 def _wait_for_server(timeout=10):
